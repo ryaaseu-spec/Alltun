@@ -115,7 +115,7 @@ def get_mute_role(guild):
         role = guild.get_role(rid)
         if role:
             return role
-    return get_mute_role(guild)
+    return discord.utils.get(guild.roles, name="Muted")
 
 
 def is_mute_role(role):
