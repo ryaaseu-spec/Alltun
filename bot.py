@@ -5,6 +5,7 @@ import datetime
 import os
 import json
 import asyncio
+import time
 
 # =========================================================
 # 1. BOT SETTINGS
@@ -225,6 +226,35 @@ def who(entry, default="Unknown"):
     return entry.user.mention if entry and entry.user else default
 
 
+# ---- Mute / Unmute log (shown in the Ban Log channel, with Ban / Timeout) ----
+_recent_cmd_mutes = {}   # user_id -> time of a mute/unmute done by the bot's own commands
+
+
+def mark_cmd_mute(user_id):
+    """The bot's own mute/unmute commands log themselves (with the real moderator),
+    so on_member_update must not log the same role change a second time."""
+    _recent_cmd_mutes[user_id] = time.time()
+
+
+async def log_mute_event(guild, target, by, muted, channel=None, via=None):
+    lines = [
+        f"**Member:** {target.mention}",
+        f"**{'Muted' if muted else 'Unmuted'} By:** {by}",
+    ]
+    if channel is not None:
+        lines.append(f"**Channel:** {channel.mention}")
+    if via:
+        lines.append(f"**Via:** {via}")
+
+    embed = make_embed(
+        "🔇 Member Muted" if muted else "🔈 Member Unmuted",
+        "\n".join(lines),
+        discord.Color.red() if muted else discord.Color.green()
+    )
+    add_user_thumbnail(embed, target)
+    await send_log(guild, "ban", embed)
+
+
 # =========================================================
 # 5. READY
 # =========================================================
@@ -323,6 +353,40 @@ async def on_member_update(before, after):
         )
         add_user_thumbnail(embed, after)
         await send_log(guild, "nickname", embed)
+
+    # ---- Discord Timeout (shown in the Ban Log channel) ----
+    if before.timed_out_until != after.timed_out_until:
+        entry = await get_audit_executor(guild, discord.AuditLogAction.member_update, after.id)
+        by = who(entry)
+        reason_line = f"\n**Reason:** {entry.reason}" if entry and entry.reason else ""
+
+        if after.timed_out_until:
+            ts = int(after.timed_out_until.timestamp())
+            embed = make_embed(
+                "⏳ Member Timed Out",
+                f"**Member:** {after.mention}\n"
+                f"**Timed Out By:** {by}\n"
+                f"**Until:** <t:{ts}:F> (<t:{ts}:R>){reason_line}",
+                discord.Color.orange()
+            )
+        else:
+            embed = make_embed(
+                "✅ Timeout Removed",
+                f"**Member:** {after.mention}\n"
+                f"**Removed By:** {by}{reason_line}",
+                discord.Color.green()
+            )
+        add_user_thumbnail(embed, after)
+        await send_log(guild, "ban", embed)
+
+    # ---- Mute role given / removed by hand (not by the bot's own command) ----
+    mute_role_obj = get_mute_role(guild)
+    if mute_role_obj and (mute_role_obj in before.roles) != (mute_role_obj in after.roles):
+        if time.time() - _recent_cmd_mutes.get(after.id, 0) > 10:
+            entry = await get_audit_executor(guild, discord.AuditLogAction.member_role_update, after.id)
+            await log_mute_event(
+                guild, after, who(entry), mute_role_obj in after.roles, via="Role changed by hand"
+            )
 
     added_roles = set(after.roles) - set(before.roles)
     removed_roles = set(before.roles) - set(after.roles)
@@ -842,7 +906,12 @@ async def on_message(message):
                 await message.channel.send(reason, delete_after=15)
                 return
             if muted_role not in target.roles:
+                mark_cmd_mute(target.id)
                 await target.add_roles(muted_role, reason=f"Muted by {message.author}")
+                await log_mute_event(
+                    message.guild, target, message.author.mention, True,
+                    channel=message.channel, via="Bot command"
+                )
             try:
                 await message.delete()
             except Exception:
@@ -873,7 +942,12 @@ async def on_message(message):
         try:
             muted_role = get_mute_role(message.guild)
             if muted_role and muted_role in target.roles:
+                mark_cmd_mute(target.id)
                 await target.remove_roles(muted_role)
+                await log_mute_event(
+                    message.guild, target, message.author.mention, False,
+                    channel=message.channel, via="Bot command"
+                )
             try:
                 await message.delete()
             except Exception:
