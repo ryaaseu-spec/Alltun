@@ -6,6 +6,8 @@ import os
 import json
 import asyncio
 import time
+import re
+from collections import defaultdict, deque
 
 # =========================================================
 # 1. BOT SETTINGS
@@ -1685,7 +1687,679 @@ async def regri(interaction: discord.Interaction, member: discord.Member, action
 
 
 # =========================================================
-# 29. RUN BOT
+# 29. SECURITY SYSTEM  (/security)
+# =========================================================
+# Anti-Spam / Anti-Mention / Anti-Invite / Anti-Link
+# Anti-Nuke: Channel + Role create/delete/rename/permissions, Ban, Kick, Bot Add
+# هەموو Limit و چرکە و ماوەی Timeout لە /security دەستکاری دەکرێن.
+
+# key: (label, default_enabled, default_limit, default_seconds, default_timeout_min, hint)
+SEC_MODULES = {
+    "spam": ("Anti-Spam", True, 5, 5, 10,
+             "Limit = چەند نامە ڕێگەپێدراوە لە Seconds چرکەدا. زیاتر بنێرێت = سزا + سڕینەوەی نامەکان"),
+    "mention": ("Anti-Mention", True, 5, 0, 10,
+                "Limit = زۆرترین تاگ لە یەک نامەدا (Seconds بەکارنایەت)"),
+    "invite": ("Anti-Invite", True, 1, 60, 30,
+               "Limit = چەند لینکی بانگهێشت ڕێگەپێدراوە لە Seconds چرکەدا"),
+    "link": ("Anti-Link", False, 2, 30, 10,
+             "Limit = چەند لینک ڕێگەپێدراوە لە Seconds چرکەدا"),
+    "chan_create": ("Channel Create", True, 2, 60, 60, "چەند چەناڵ دروست بکرێت لە Seconds چرکەدا"),
+    "chan_delete": ("Channel Delete", True, 2, 60, 60, "چەند چەناڵ بسڕدرێتەوە لە Seconds چرکەدا"),
+    "chan_name": ("Channel Rename", True, 3, 60, 60, "چەند جار ناوی چەناڵ بگۆڕدرێت"),
+    "chan_perm": ("Channel Permissions", True, 3, 60, 60, "چەند جار پێرمشنی چەناڵ بگۆڕدرێت"),
+    "role_create": ("Role Create", True, 2, 60, 60, "چەند ڕۆڵ دروست بکرێت"),
+    "role_delete": ("Role Delete", True, 2, 60, 60, "چەند ڕۆڵ بسڕدرێتەوە"),
+    "role_name": ("Role Rename", True, 3, 60, 60, "چەند جار ناوی ڕۆڵ بگۆڕدرێت"),
+    "role_perm": ("Role Permissions", True, 3, 60, 60, "چەند جار پێرمشنی ڕۆڵ بگۆڕدرێت"),
+    "ban": ("Anti-Ban", True, 2, 60, 60, "چەند کەس Ban بکرێن"),
+    "kick": ("Anti-Kick", True, 2, 60, 60, "چەند کەس Kick بکرێن"),
+    "bot_add": ("Anti-Bot Add", True, 0, 60, 60, "Limit 0 = هەر بۆتێک زیاد بکرێت، بۆتەکە دەردەکرێت و زیادکەرەکە سزا دەدرێت"),
+}
+
+SEC_PUNISH_ORDER = ["timeout", "kick", "ban", "none"]
+SEC_PUNISH_LABELS = {"timeout": "Timeout", "kick": "Kick", "ban": "Ban", "none": "Warning only"}
+
+SEC_INVITE_RX = re.compile(r"(discord\.gg|discord(?:app)?\.com/invite)/[\w-]+", re.I)
+SEC_LINK_RX = re.compile(r"https?://\S+", re.I)
+
+_sec_hits = defaultdict(deque)
+_sec_details = defaultdict(list)
+_sec_spam = defaultdict(deque)
+
+
+def get_sec(gid):
+    c = cfg(gid)
+    s = c.setdefault("security", {})
+    s.setdefault("enabled", True)
+    s.setdefault("log_channel", None)     # warning channel (chosen in /security)
+    s.setdefault("punish", "timeout")
+    s.setdefault("remove_roles", True)
+    s.setdefault("wl_users", [])
+    s.setdefault("wl_roles", [])
+    mods = s.setdefault("modules", {})
+    for k, (_, en, lim, sec, tmo, _) in SEC_MODULES.items():
+        m = mods.setdefault(k, {"enabled": en, "limit": lim, "seconds": sec, "timeout": tmo})
+        m.setdefault("timeout", tmo)
+    return s
+
+
+def sec_mod_on(guild, key):
+    s = get_sec(guild.id)
+    return s["enabled"] and s["modules"][key]["enabled"]
+
+
+def sec_exempt(guild, user_id):
+    """Bot itself, owner, developer roles (/setdev) and the whitelist are never punished."""
+    if user_id == bot.user.id or user_id == guild.owner_id:
+        return True
+    s = get_sec(guild.id)
+    if user_id in s["wl_users"]:
+        return True
+    m = guild.get_member(user_id)
+    if m is None:
+        return False
+    if is_dev(m):
+        return True
+    return any(r.id in s["wl_roles"] for r in m.roles)
+
+
+async def sec_audit(guild, actions, target_id):
+    await asyncio.sleep(1.0)
+    for action in actions:
+        try:
+            async for entry in guild.audit_logs(limit=6, action=action):
+                if getattr(entry.target, "id", None) != target_id:
+                    continue
+                age = (datetime.datetime.now(datetime.timezone.utc) - entry.created_at).total_seconds()
+                if age > 15:
+                    continue
+                return entry
+        except Exception:
+            pass
+    return None
+
+
+def sec_executor_id(entry, ban_kind=None, target_id=None):
+    uid = entry.user.id if entry and entry.user else None
+    if uid == bot.user.id and ban_kind:
+        by = cmd_ban_by(ban_kind, target_id)   # ban done with the bot's own "bfra" command
+        if by:
+            found = re.search(r"\d+", by)
+            if found:
+                return int(found.group())
+    return uid
+
+
+def sec_add_detail(gid, uid, text):
+    lst = _sec_details[(gid, uid)]
+    lst.append(text)
+    del lst[:-10]
+
+
+async def sec_send_warning(guild, embed):
+    try:
+        s = get_sec(guild.id)
+        cid = s.get("log_channel") or cfg(guild.id)["channels"].get("server")
+        ch = guild.get_channel(cid) if cid else None
+        if ch:
+            await ch.send(embed=embed)
+    except Exception:
+        pass
+
+
+async def sec_punish(guild, uid, key, count):
+    s = get_sec(guild.id)
+    m = s["modules"][key]
+    label = SEC_MODULES[key][0]
+    results = []
+
+    member = guild.get_member(uid)
+    if member is None:
+        try:
+            member = await guild.fetch_member(uid)
+        except Exception:
+            member = None
+
+    if member is None:
+        results.append("⚠ ئەندامەکە لە سێرڤەر نەماوە.")
+    else:
+        me = guild.me
+        reason = f"Security: {label}"
+
+        # ---- remove roles ----
+        if s["remove_roles"]:
+            roles = [r for r in member.roles
+                     if not r.is_default() and not r.managed and r < me.top_role]
+            if roles:
+                try:
+                    await member.remove_roles(*roles, reason=reason)
+                    results.append("✅ ڕۆڵەکانی لابرا: " + ", ".join(f"`{r.name}`" for r in roles))
+                except Exception:
+                    results.append("❌ نەتوانرا ڕۆڵەکان لابدرێن (ڕۆڵی بۆتەکە بەرز بکەرەوە).")
+            else:
+                results.append("ℹ️ ڕۆڵێک نەبوو بۆ لابردن.")
+
+        # ---- timeout / kick / ban ----
+        p = s["punish"]
+        try:
+            if p == "timeout":
+                mins = max(1, min(int(m["timeout"]), 40320))
+                await member.timeout(datetime.timedelta(minutes=mins), reason=reason)
+                results.append(f"✅ Timeout بۆ `{mins}` خولەک.")
+            elif p == "kick":
+                await member.kick(reason=reason)
+                results.append("✅ Kick کرا.")
+            elif p == "ban":
+                await member.ban(reason=reason, delete_message_seconds=0)
+                results.append("✅ Ban کرا.")
+        except Exception:
+            results.append(f"❌ نەتوانرا `{SEC_PUNISH_LABELS[p]}` بکرێت (مۆڵەت / ڕۆڵی بۆتەکە).")
+
+    details = _sec_details.pop((guild.id, uid), [])
+    window = f"لە `{m['seconds']}` چرکەدا" if m["seconds"] > 0 else "لە یەک نامەدا"
+    embed = discord.Embed(
+        title="🛡️ Security Warning",
+        description=(
+            f"**Member:** <@{uid}>\n"
+            f"**بەش:** {label}\n\n"
+            f"**هۆکاری سزا:**\n"
+            f"ئەم ئەندامە {window} `{count}` جار ئەم کارەی کرد، لە کاتێکدا Limit ـەکە `{m['limit']}` ـە.\n\n"
+            f"**چی کرد:**\n" + ("\n".join(details) or "—") +
+            "\n\n**سزا:**\n" + "\n".join(results)
+        ),
+        color=discord.Color.red(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+    embed.set_footer(text="Security")
+    if member:
+        add_user_thumbnail(embed, member)
+    await sec_send_warning(guild, embed)
+
+
+async def sec_register(guild, uid, key, what):
+    """Count one action. Returns True if the user was punished."""
+    if uid is None or not sec_mod_on(guild, key) or sec_exempt(guild, uid):
+        return False
+    m = get_sec(guild.id)["modules"][key]
+    sec_add_detail(guild.id, uid, what)
+    dq = _sec_hits[(guild.id, uid, key)]
+    now = time.time()
+    dq.append(now)
+    if m["seconds"] > 0:
+        while dq and now - dq[0] > m["seconds"]:
+            dq.popleft()
+    if len(dq) > m["limit"]:
+        n = len(dq)
+        dq.clear()
+        await sec_punish(guild, uid, key, n)
+        return True
+    return False
+
+
+# ---------------------------------------------------------
+# message protection
+# ---------------------------------------------------------
+
+async def sec_safe_delete(message):
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+async def sec_on_message(message):
+    if message.author.bot or message.guild is None:
+        return
+
+    guild = message.guild
+    s = get_sec(guild.id)
+    if not s["enabled"] or sec_exempt(guild, message.author.id):
+        return
+
+    uid = message.author.id
+    mods = s["modules"]
+    text = message.content or ""
+
+    # ---- mention spam ----
+    if mods["mention"]["enabled"]:
+        cnt = len(message.mentions) + len(message.role_mentions) + (1 if message.mention_everyone else 0)
+        if cnt > mods["mention"]["limit"]:
+            await sec_safe_delete(message)
+            sec_add_detail(guild.id, uid, f"📢 {cnt} تاگی کرد لە یەک نامەدا لە {message.channel.mention}")
+            await sec_punish(guild, uid, "mention", cnt)
+            return
+
+    # ---- invite / link ----
+    for key, rx in (("invite", SEC_INVITE_RX), ("link", SEC_LINK_RX)):
+        if mods[key]["enabled"] and rx.search(text):
+            await sec_safe_delete(message)
+            done = await sec_register(
+                guild, uid, key,
+                f"🔗 {SEC_MODULES[key][0]}: لینکی نارد لە {message.channel.mention}"
+            )
+            if not done:
+                try:
+                    await message.channel.send(
+                        f"⚠ {message.author.mention} نابێت لینک بنێریت.", delete_after=6)
+                except Exception:
+                    pass
+            return
+
+    # ---- message spam ----
+    m = mods["spam"]
+    if m["enabled"]:
+        now = time.time()
+        dq = _sec_spam[(guild.id, uid)]
+        dq.append((now, message))
+        while dq and now - dq[0][0] > m["seconds"]:
+            dq.popleft()
+        if len(dq) > m["limit"]:
+            msgs = [x[1] for x in dq]
+            dq.clear()
+            by_ch = defaultdict(list)
+            for x in msgs:
+                by_ch[x.channel].append(x)
+            for ch, lst in by_ch.items():
+                try:
+                    await ch.delete_messages(lst)
+                except Exception:
+                    pass
+            sec_add_detail(guild.id, uid, f"💬 {len(msgs)} نامەی نارد لە {m['seconds']} چرکەدا")
+            await sec_punish(guild, uid, "spam", len(msgs))
+
+
+# ---------------------------------------------------------
+# anti-nuke events
+# ---------------------------------------------------------
+
+async def sec_on_channel_create(channel):
+    g = channel.guild
+    if not sec_mod_on(g, "chan_create"):
+        return
+    entry = await sec_audit(g, [discord.AuditLogAction.channel_create], channel.id)
+    if entry and entry.user:
+        await sec_register(g, entry.user.id, "chan_create", f"📁 چەناڵی `{channel.name}` دروست کرد")
+
+
+async def sec_on_channel_delete(channel):
+    g = channel.guild
+    if not sec_mod_on(g, "chan_delete"):
+        return
+    entry = await sec_audit(g, [discord.AuditLogAction.channel_delete], channel.id)
+    if entry and entry.user:
+        await sec_register(g, entry.user.id, "chan_delete", f"🗑️ چەناڵی `#{channel.name}` سڕییەوە")
+
+
+async def sec_on_channel_update(before, after):
+    g = after.guild
+    if before.name != after.name and sec_mod_on(g, "chan_name"):
+        entry = await sec_audit(g, [discord.AuditLogAction.channel_update], after.id)
+        if entry and entry.user:
+            await sec_register(g, entry.user.id, "chan_name",
+                               f"✏️ ناوی چەناڵی `{before.name}` گۆڕی بۆ `{after.name}`")
+    if before.overwrites != after.overwrites and sec_mod_on(g, "chan_perm"):
+        entry = await sec_audit(g, [discord.AuditLogAction.overwrite_update,
+                                    discord.AuditLogAction.overwrite_create,
+                                    discord.AuditLogAction.overwrite_delete], after.id)
+        if entry and entry.user:
+            await sec_register(g, entry.user.id, "chan_perm",
+                               f"🔐 پێرمشنی چەناڵی {after.mention} گۆڕی")
+
+
+async def sec_on_role_create(role):
+    g = role.guild
+    if role.managed or not sec_mod_on(g, "role_create"):
+        return
+    entry = await sec_audit(g, [discord.AuditLogAction.role_create], role.id)
+    if entry and entry.user:
+        await sec_register(g, entry.user.id, "role_create", f"➕ ڕۆڵی `{role.name}` دروست کرد")
+
+
+async def sec_on_role_delete(role):
+    g = role.guild
+    if role.managed or not sec_mod_on(g, "role_delete"):
+        return
+    entry = await sec_audit(g, [discord.AuditLogAction.role_delete], role.id)
+    if entry and entry.user:
+        await sec_register(g, entry.user.id, "role_delete", f"🗑️ ڕۆڵی `{role.name}` سڕییەوە")
+
+
+async def sec_on_role_update(before, after):
+    g = after.guild
+    if after.managed:
+        return
+    if before.name != after.name and sec_mod_on(g, "role_name"):
+        entry = await sec_audit(g, [discord.AuditLogAction.role_update], after.id)
+        if entry and entry.user:
+            await sec_register(g, entry.user.id, "role_name",
+                               f"✏️ ناوی ڕۆڵی `{before.name}` گۆڕی بۆ `{after.name}`")
+    if before.permissions != after.permissions and sec_mod_on(g, "role_perm"):
+        entry = await sec_audit(g, [discord.AuditLogAction.role_update], after.id)
+        if entry and entry.user:
+            await sec_register(g, entry.user.id, "role_perm",
+                               f"🔐 پێرمشنی ڕۆڵی `{after.name}` گۆڕی")
+
+
+async def sec_on_ban(guild, user):
+    if not sec_mod_on(guild, "ban"):
+        return
+    entry = await sec_audit(guild, [discord.AuditLogAction.ban], user.id)
+    uid = sec_executor_id(entry, "ban", user.id)
+    if uid:
+        await sec_register(guild, uid, "ban", f"🔨 {user} (`{user.id}`) ی Ban کرد")
+
+
+async def sec_on_member_remove(member):
+    g = member.guild
+    if not sec_mod_on(g, "kick"):
+        return
+    entry = await sec_audit(g, [discord.AuditLogAction.kick], member.id)
+    if entry and entry.user:
+        await sec_register(g, entry.user.id, "kick", f"👢 {member} (`{member.id}`) ی Kick کرد")
+
+
+async def sec_on_member_join(member):
+    if not member.bot:
+        return
+    g = member.guild
+    if not sec_mod_on(g, "bot_add"):
+        return
+    entry = await sec_audit(g, [discord.AuditLogAction.bot_add], member.id)
+    if not (entry and entry.user) or sec_exempt(g, entry.user.id):
+        return
+    try:
+        await member.kick(reason="Security: Anti-Bot Add")
+    except Exception:
+        pass
+    await sec_register(g, entry.user.id, "bot_add", f"🤖 بۆتی {member} (`{member.id}`) ی زیادکرد (دەرکرا)")
+
+
+bot.add_listener(sec_on_message, "on_message")
+bot.add_listener(sec_on_channel_create, "on_guild_channel_create")
+bot.add_listener(sec_on_channel_delete, "on_guild_channel_delete")
+bot.add_listener(sec_on_channel_update, "on_guild_channel_update")
+bot.add_listener(sec_on_role_create, "on_guild_role_create")
+bot.add_listener(sec_on_role_delete, "on_guild_role_delete")
+bot.add_listener(sec_on_role_update, "on_guild_role_update")
+bot.add_listener(sec_on_ban, "on_member_ban")
+bot.add_listener(sec_on_member_remove, "on_member_remove")
+bot.add_listener(sec_on_member_join, "on_member_join")
+
+
+# ---------------------------------------------------------
+# /security panel
+# ---------------------------------------------------------
+
+def sec_main_embed(guild):
+    s = get_sec(guild.id)
+    lines = []
+    for k, (label, *_rest) in SEC_MODULES.items():
+        m = s["modules"][k]
+        lines.append(
+            f"{'🟢' if m['enabled'] else '🔴'} **{label}** — `{m['limit']}` / `{m['seconds']}s` / `{m['timeout']}m`"
+        )
+    e = discord.Embed(
+        title="🛡️ Security " + ("(ON)" if s["enabled"] else "(OFF)"),
+        description="\n".join(lines),
+        color=discord.Color.green() if s["enabled"] else discord.Color.red()
+    )
+    lc = s.get("log_channel")
+    e.add_field(
+        name="کەناڵی وارنینگ",
+        value=f"<#{lc}>" if lc else "❌ دیاری نەکراوە (Server Log بەکاردێت)",
+        inline=False
+    )
+    e.add_field(
+        name="سزا",
+        value=f"**{SEC_PUNISH_LABELS[s['punish']]}**\n"
+              f"لابردنی ڕۆڵەکان: **{'بەڵێ' if s['remove_roles'] else 'نەخێر'}**",
+        inline=False
+    )
+    e.set_footer(text="Limit / Seconds / Timeout(خولەک) — بەشێک هەڵبژێرە بۆ دەستکاری")
+    return e
+
+
+def sec_module_embed(guild, key):
+    label, _, _, _, _, hint = SEC_MODULES[key]
+    m = get_sec(guild.id)["modules"][key]
+    e = discord.Embed(
+        title=f"🛡️ {label}",
+        description=hint,
+        color=discord.Color.green() if m["enabled"] else discord.Color.red()
+    )
+    e.add_field(name="Status", value="🟢 ON" if m["enabled"] else "🔴 OFF")
+    e.add_field(name="Limit", value=f"`{m['limit']}`")
+    e.add_field(name="Seconds", value=f"`{m['seconds']}`")
+    e.add_field(name="Timeout (خولەک)", value=f"`{m['timeout']}`")
+    return e
+
+
+def sec_wl_embed(guild):
+    s = get_sec(guild.id)
+    us = ", ".join(f"<@{u}>" for u in s["wl_users"]) or "—"
+    rs = ", ".join(f"<@&{r}>" for r in s["wl_roles"]) or "—"
+    return discord.Embed(
+        title="✅ Whitelist",
+        description=(
+            f"**Users:** {us}\n**Roles:** {rs}\n\n"
+            "ئەوەی هەڵیدەبژێریت: ئەگەر لە لیستدا بێت لادەچێت، ئەگەر نەبێت زیاد دەبێت.\n"
+            "Owner و Developer (`/setdev`) خۆکار ڕزگاربوون."
+        ),
+        color=discord.Color.blurple()
+    )
+
+
+class SecBaseView(discord.ui.View):
+    def __init__(self, guild, author_id):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.author_id = author_id
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.author_id or not is_dev(interaction.user):
+            await deny_interaction(interaction)
+            return False
+        return True
+
+
+class SecModuleSelect(discord.ui.Select):
+    def __init__(self, guild):
+        s = get_sec(guild.id)
+        opts = [
+            discord.SelectOption(
+                label=label, value=k, description=hint[:100],
+                emoji="🟢" if s["modules"][k]["enabled"] else "🔴"
+            )
+            for k, (label, _, _, _, _, hint) in SEC_MODULES.items()
+        ]
+        super().__init__(placeholder="بەشێک هەڵبژێرە...", options=opts, row=0)
+
+    async def callback(self, interaction):
+        key = self.values[0]
+        await interaction.response.edit_message(
+            embed=sec_module_embed(self.view.guild, key),
+            view=SecModuleView(self.view.guild, self.view.author_id, key)
+        )
+
+
+class SecLogChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="کەناڵی وارنینگ هەڵبژێرە...",
+            channel_types=[discord.ChannelType.text],
+            min_values=1, max_values=1, row=1
+        )
+
+    async def callback(self, interaction):
+        get_sec(self.view.guild.id)["log_channel"] = self.values[0].id
+        save_config()
+        await interaction.response.edit_message(
+            embed=sec_main_embed(self.view.guild),
+            view=SecMainView(self.view.guild, self.view.author_id)
+        )
+
+
+class SecMainView(SecBaseView):
+    def __init__(self, guild, author_id):
+        super().__init__(guild, author_id)
+        s = get_sec(guild.id)
+        self.add_item(SecModuleSelect(guild))
+        self.add_item(SecLogChannelSelect())
+        self.toggle.label = "Security: ON" if s["enabled"] else "Security: OFF"
+        self.toggle.style = discord.ButtonStyle.success if s["enabled"] else discord.ButtonStyle.danger
+        self.punish_btn.label = "Punishment: " + SEC_PUNISH_LABELS[s["punish"]]
+        self.roles_btn.label = "Remove Roles: " + ("ON" if s["remove_roles"] else "OFF")
+
+    @discord.ui.button(label="Security", row=2)
+    async def toggle(self, interaction, button):
+        s = get_sec(self.guild.id)
+        s["enabled"] = not s["enabled"]
+        save_config()
+        await interaction.response.edit_message(
+            embed=sec_main_embed(self.guild), view=SecMainView(self.guild, self.author_id))
+
+    @discord.ui.button(label="Punishment", style=discord.ButtonStyle.primary, row=2)
+    async def punish_btn(self, interaction, button):
+        s = get_sec(self.guild.id)
+        i = SEC_PUNISH_ORDER.index(s["punish"])
+        s["punish"] = SEC_PUNISH_ORDER[(i + 1) % len(SEC_PUNISH_ORDER)]
+        save_config()
+        await interaction.response.edit_message(
+            embed=sec_main_embed(self.guild), view=SecMainView(self.guild, self.author_id))
+
+    @discord.ui.button(label="Remove Roles", style=discord.ButtonStyle.primary, row=3)
+    async def roles_btn(self, interaction, button):
+        s = get_sec(self.guild.id)
+        s["remove_roles"] = not s["remove_roles"]
+        save_config()
+        await interaction.response.edit_message(
+            embed=sec_main_embed(self.guild), view=SecMainView(self.guild, self.author_id))
+
+    @discord.ui.button(label="Whitelist", style=discord.ButtonStyle.secondary, row=3)
+    async def wl_btn(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=sec_wl_embed(self.guild), view=SecWhitelistView(self.guild, self.author_id))
+
+
+class SecLimitModal(discord.ui.Modal):
+    def __init__(self, guild, author_id, key):
+        super().__init__(title=f"Edit: {SEC_MODULES[key][0]}"[:45])
+        m = get_sec(guild.id)["modules"][key]
+        self.guild, self.author_id, self.key = guild, author_id, key
+        self.limit = discord.ui.TextInput(label="Limit", default=str(m["limit"]), max_length=4)
+        self.seconds = discord.ui.TextInput(label="Seconds (چرکە)", default=str(m["seconds"]), max_length=5)
+        self.timeout_min = discord.ui.TextInput(label="Timeout (خولەک)", default=str(m["timeout"]), max_length=5)
+        self.add_item(self.limit)
+        self.add_item(self.seconds)
+        self.add_item(self.timeout_min)
+
+    async def on_submit(self, interaction):
+        try:
+            lim = int(self.limit.value)
+            sec = int(self.seconds.value)
+            tmo = int(self.timeout_min.value)
+            assert lim >= 0 and sec >= 0 and 1 <= tmo <= 40320
+        except Exception:
+            await interaction.response.send_message(
+                "❌ تەنها ژمارە بنووسە (Timeout لە 1 تا 40320 خولەک).", ephemeral=True)
+            return
+        m = get_sec(self.guild.id)["modules"][self.key]
+        m["limit"], m["seconds"], m["timeout"] = lim, sec, tmo
+        save_config()
+        await interaction.response.edit_message(
+            embed=sec_module_embed(self.guild, self.key),
+            view=SecModuleView(self.guild, self.author_id, self.key))
+
+
+class SecModuleView(SecBaseView):
+    def __init__(self, guild, author_id, key):
+        super().__init__(guild, author_id)
+        self.key = key
+        on = get_sec(guild.id)["modules"][key]["enabled"]
+        self.toggle.label = "Turn OFF" if on else "Turn ON"
+        self.toggle.style = discord.ButtonStyle.danger if on else discord.ButtonStyle.success
+
+    @discord.ui.button(label="Toggle")
+    async def toggle(self, interaction, button):
+        m = get_sec(self.guild.id)["modules"][self.key]
+        m["enabled"] = not m["enabled"]
+        save_config()
+        await interaction.response.edit_message(
+            embed=sec_module_embed(self.guild, self.key),
+            view=SecModuleView(self.guild, self.author_id, self.key))
+
+    @discord.ui.button(label="Edit Limit / Seconds / Timeout", style=discord.ButtonStyle.primary)
+    async def edit_btn(self, interaction, button):
+        await interaction.response.send_modal(SecLimitModal(self.guild, self.author_id, self.key))
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=sec_main_embed(self.guild), view=SecMainView(self.guild, self.author_id))
+
+
+class SecWLUsers(discord.ui.UserSelect):
+    def __init__(self):
+        super().__init__(placeholder="Users", min_values=1, max_values=10, row=0)
+
+    async def callback(self, interaction):
+        s = get_sec(self.view.guild.id)
+        for u in self.values:
+            if u.id in s["wl_users"]:
+                s["wl_users"].remove(u.id)
+            else:
+                s["wl_users"].append(u.id)
+        save_config()
+        await interaction.response.edit_message(
+            embed=sec_wl_embed(self.view.guild),
+            view=SecWhitelistView(self.view.guild, self.view.author_id))
+
+
+class SecWLRoles(discord.ui.RoleSelect):
+    def __init__(self):
+        super().__init__(placeholder="Roles", min_values=1, max_values=10, row=1)
+
+    async def callback(self, interaction):
+        s = get_sec(self.view.guild.id)
+        for r in self.values:
+            if r.id in s["wl_roles"]:
+                s["wl_roles"].remove(r.id)
+            else:
+                s["wl_roles"].append(r.id)
+        save_config()
+        await interaction.response.edit_message(
+            embed=sec_wl_embed(self.view.guild),
+            view=SecWhitelistView(self.view.guild, self.view.author_id))
+
+
+class SecWhitelistView(SecBaseView):
+    def __init__(self, guild, author_id):
+        super().__init__(guild, author_id)
+        self.add_item(SecWLUsers())
+        self.add_item(SecWLRoles())
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary, row=2)
+    async def back(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=sec_main_embed(self.guild), view=SecMainView(self.guild, self.author_id))
+
+
+@bot.tree.command(name="security", description="سیستمی پاراستن (Anti-Spam / Anti-Nuke)")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def security_cmd(interaction: discord.Interaction):
+    if not is_dev(interaction.user):
+        await deny_interaction(interaction)
+        return
+    await interaction.response.send_message(
+        embed=sec_main_embed(interaction.guild),
+        view=SecMainView(interaction.guild, interaction.user.id),
+        ephemeral=True
+    )
+
+
+# =========================================================
+# 30. RUN BOT
 # =========================================================
 
 TOKEN = os.getenv("DISCORD_TOKEN")
