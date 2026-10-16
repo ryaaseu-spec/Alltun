@@ -1716,6 +1716,9 @@ SEC_MODULES = {
     "bot_add": ("Anti-Bot Add", True, 0, 60, 60, "Limit 0 = هەر بۆتێک زیاد بکرێت، بۆتەکە دەردەکرێت و زیادکەرەکە سزا دەدرێت"),
 }
 
+# تەنها ئەم بەشانە ڕۆڵەکان لادەبەن (دەتوانیت لە /security بۆ هەر بەشێک بیگۆڕیت)
+SEC_ROLE_REMOVE_DEFAULT = {"chan_delete", "ban", "kick"}
+
 SEC_PUNISH_ORDER = ["timeout", "kick", "ban", "none"]
 SEC_PUNISH_LABELS = {"timeout": "Timeout", "kick": "Kick", "ban": "Ban", "none": "Warning only"}
 
@@ -1740,6 +1743,7 @@ def get_sec(gid):
     for k, (_, en, lim, sec, tmo, _) in SEC_MODULES.items():
         m = mods.setdefault(k, {"enabled": en, "limit": lim, "seconds": sec, "timeout": tmo})
         m.setdefault("timeout", tmo)
+        m.setdefault("remove_roles", k in SEC_ROLE_REMOVE_DEFAULT)
     return s
 
 
@@ -1827,7 +1831,7 @@ async def sec_punish(guild, uid, key, count):
         reason = f"Security: {label}"
 
         # ---- remove roles ----
-        if s["remove_roles"]:
+        if m["remove_roles"]:
             roles = [r for r in member.roles
                      if not r.is_default() and not r.managed and r < me.top_role]
             if roles:
@@ -1838,6 +1842,8 @@ async def sec_punish(guild, uid, key, count):
                     results.append("❌ نەتوانرا ڕۆڵەکان لابدرێن (ڕۆڵی بۆتەکە بەرز بکەرەوە).")
             else:
                 results.append("ℹ️ ڕۆڵێک نەبوو بۆ لابردن.")
+        else:
+            results.append("ℹ️ لابردنی ڕۆڵ بۆ ئەم بەشە OFF ـە.")
 
         # ---- timeout / kick / ban ----
         p = s["punish"]
@@ -2097,6 +2103,7 @@ def sec_main_embed(guild):
         m = s["modules"][k]
         lines.append(
             f"{'🟢' if m['enabled'] else '🔴'} **{label}** — `{m['limit']}` / `{m['seconds']}s` / `{m['timeout']}m`"
+            + (" 🎭" if m["remove_roles"] else "")
         )
     e = discord.Embed(
         title="🛡️ Security " + ("(ON)" if s["enabled"] else "(OFF)"),
@@ -2111,8 +2118,7 @@ def sec_main_embed(guild):
     )
     e.add_field(
         name="سزا",
-        value=f"**{SEC_PUNISH_LABELS[s['punish']]}**\n"
-              f"لابردنی ڕۆڵەکان: **{'بەڵێ' if s['remove_roles'] else 'نەخێر'}**",
+        value=f"**{SEC_PUNISH_LABELS[s['punish']]}**\n🎭 = ڕۆڵەکان لادەبرێن",
         inline=False
     )
     e.set_footer(text="Limit / Seconds / Timeout(خولەک) — بەشێک هەڵبژێرە بۆ دەستکاری")
@@ -2131,6 +2137,7 @@ def sec_module_embed(guild, key):
     e.add_field(name="Limit", value=f"`{m['limit']}`")
     e.add_field(name="Seconds", value=f"`{m['seconds']}`")
     e.add_field(name="Timeout (خولەک)", value=f"`{m['timeout']}`")
+    e.add_field(name="Remove Roles", value="🎭 بەڵێ" if m["remove_roles"] else "نەخێر")
     return e
 
 
@@ -2208,7 +2215,6 @@ class SecMainView(SecBaseView):
         self.toggle.label = "Security: ON" if s["enabled"] else "Security: OFF"
         self.toggle.style = discord.ButtonStyle.success if s["enabled"] else discord.ButtonStyle.danger
         self.punish_btn.label = "Punishment: " + SEC_PUNISH_LABELS[s["punish"]]
-        self.roles_btn.label = "Remove Roles: " + ("ON" if s["remove_roles"] else "OFF")
 
     @discord.ui.button(label="Security", row=2)
     async def toggle(self, interaction, button):
@@ -2223,14 +2229,6 @@ class SecMainView(SecBaseView):
         s = get_sec(self.guild.id)
         i = SEC_PUNISH_ORDER.index(s["punish"])
         s["punish"] = SEC_PUNISH_ORDER[(i + 1) % len(SEC_PUNISH_ORDER)]
-        save_config()
-        await interaction.response.edit_message(
-            embed=sec_main_embed(self.guild), view=SecMainView(self.guild, self.author_id))
-
-    @discord.ui.button(label="Remove Roles", style=discord.ButtonStyle.primary, row=3)
-    async def roles_btn(self, interaction, button):
-        s = get_sec(self.guild.id)
-        s["remove_roles"] = not s["remove_roles"]
         save_config()
         await interaction.response.edit_message(
             embed=sec_main_embed(self.guild), view=SecMainView(self.guild, self.author_id))
@@ -2275,14 +2273,26 @@ class SecModuleView(SecBaseView):
     def __init__(self, guild, author_id, key):
         super().__init__(guild, author_id)
         self.key = key
-        on = get_sec(guild.id)["modules"][key]["enabled"]
+        mm = get_sec(guild.id)["modules"][key]
+        on = mm["enabled"]
         self.toggle.label = "Turn OFF" if on else "Turn ON"
         self.toggle.style = discord.ButtonStyle.danger if on else discord.ButtonStyle.success
+        self.roles_btn.label = "Remove Roles: " + ("ON" if mm["remove_roles"] else "OFF")
+        self.roles_btn.style = discord.ButtonStyle.success if mm["remove_roles"] else discord.ButtonStyle.secondary
 
     @discord.ui.button(label="Toggle")
     async def toggle(self, interaction, button):
         m = get_sec(self.guild.id)["modules"][self.key]
         m["enabled"] = not m["enabled"]
+        save_config()
+        await interaction.response.edit_message(
+            embed=sec_module_embed(self.guild, self.key),
+            view=SecModuleView(self.guild, self.author_id, self.key))
+
+    @discord.ui.button(label="Remove Roles", row=1)
+    async def roles_btn(self, interaction, button):
+        m = get_sec(self.guild.id)["modules"][self.key]
+        m["remove_roles"] = not m["remove_roles"]
         save_config()
         await interaction.response.edit_message(
             embed=sec_module_embed(self.guild, self.key),
