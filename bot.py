@@ -938,6 +938,7 @@ async def on_message(message):
         command = parts[0].lower()
 
     # ---------------- SAFIKA ----------------
+    # (ئەمە تەنها کۆماندێکە کە نامەکان دەسڕێتەوە - چونکە کارەکەی ئەوەیە)
     if command == "safika":
         if not has_cmd_access(message.author, "safika"):
             if looks_like_command(message, parts, command):
@@ -999,11 +1000,7 @@ async def on_message(message):
                     message.guild, target, message.author.mention, True,
                     channel=message.channel, via="Bot command"
                 )
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            # نامەکە دەمێنێتەوە (دیلیت نابێت)
+            # نامەی تۆ و نامەی بۆتەکە هەردووکیان دەمێننەوە (هیچ دیلیتێک نییە)
             await message.channel.send(f"damt daxaa {target.mention}")
         except discord.Forbidden:
             await message.channel.send(
@@ -1038,11 +1035,7 @@ async def on_message(message):
                     message.guild, target, message.author.mention, False,
                     channel=message.channel, via="Bot command"
                 )
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            # نامەکە دەمێنێتەوە (دیلیت نابێت)
+            # نامەی تۆ و نامەی بۆتەکە هەردووکیان دەمێننەوە (هیچ دیلیتێک نییە)
             await message.channel.send(
                 f"xwa xerm bnwse dllm basha aqllba amjara {target.mention}"
             )
@@ -1084,11 +1077,7 @@ async def on_message(message):
             mark_cmd_ban("ban", target.id, message.author.mention)
             # چاتی کەسە باندکراوەکە ناسڕدرێتەوە
             await target.ban(reason=f"Banned by {message.author}", delete_message_seconds=0)
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            # نامەکە دەمێنێتەوە (دیلیت نابێت)
+            # نامەی تۆ و نامەی بۆتەکە هەردووکیان دەمێننەوە (هیچ دیلیتێک نییە)
             await message.channel.send(f"Frenraa✈️ {target.mention}")
         except discord.Forbidden:
             await message.channel.send(
@@ -1121,11 +1110,8 @@ async def on_message(message):
             user = await bot.fetch_user(user_id)
             mark_cmd_ban("unban", user_id, message.author.mention)
             await message.guild.unban(user)
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            await message.channel.send("✅ Unban کرا.", delete_after=3)
+            # نامەی تۆ و نامەی بۆتەکە هەردووکیان دەمێننەوە (هیچ دیلیتێک نییە)
+            await message.channel.send("✅ Unban کرا.")
         except discord.NotFound:
             await message.channel.send("❌ ئەم کەسە لە لیستی Ban دا نییە.", delete_after=5)
         except discord.Forbidden:
@@ -1141,11 +1127,7 @@ async def on_message(message):
             return
         try:
             await message.channel.set_permissions(message.guild.default_role, send_messages=False)
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            await message.channel.send("🔒 کەناڵەکە Lock کرا.", delete_after=3)
+            await message.channel.send("🔒 کەناڵەکە Lock کرا.")
         except Exception:
             pass
         return
@@ -1156,11 +1138,7 @@ async def on_message(message):
             return
         try:
             await message.channel.set_permissions(message.guild.default_role, send_messages=None)
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            await message.channel.send("🔓 کەناڵەکە Unlock کرا.", delete_after=3)
+            await message.channel.send("🔓 کەناڵەکە Unlock کرا.")
         except Exception:
             pass
         return
