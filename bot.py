@@ -50,7 +50,16 @@ PERM_LABELS = {
     "mute": "Mute",
     "ban": "Ban (Bfra / Unban)",
     "safika": "Safika (Clear)",
+    "staff": "Staff (/staff)",
 }
+
+# ناوی پیشاندراوی ستافەکان (value ەکان وەک خۆیان ماونەتەوە بۆ ئەوەی ڕێکخستنە کۆنەکان نەچن)
+STAFF_LABELS = {
+    "staff1": "Lady Staff",
+    "staff2": "Boy Staff",
+}
+
+NO_PERM_TEXT = "To regat penadrawa ta ama bakar bhenit"
 
 try:
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -79,7 +88,8 @@ def cfg(guild_id):
     d.setdefault("welcome_image", None)  # image / gif link shown under the welcome text
     d.setdefault("dev_roles", [])      # developer roles (full control like owner)
     d.setdefault("mute_role", None)    # role given on mute (set with /setmuterole)
-    perm = d.setdefault("perm_roles", {})  # roles allowed: mute / ban / safika
+    d.setdefault("autorole", None)     # role given automatically to new members (/autorole)
+    perm = d.setdefault("perm_roles", {})  # roles allowed: mute / ban / safika / staff
     for k in PERM_LABELS:
         perm.setdefault(k, [])
     return d
@@ -105,6 +115,17 @@ def is_dev(member):
             return True
         dev = cfg(member.guild.id)["dev_roles"]
         return any(r.id in dev for r in member.roles)
+    except Exception:
+        return False
+
+
+def has_staff_access(member):
+    """Owner + developer roles + roles chosen with /rolestaff"""
+    try:
+        if is_dev(member):
+            return True
+        allowed = cfg(member.guild.id)["perm_roles"].get("staff", [])
+        return any(r.id in allowed for r in member.roles)
     except Exception:
         return False
 
@@ -161,6 +182,48 @@ def hierarchy_error(author, target):
         return None
     if target.top_role >= author.top_role:
         return "❌ ناتوانیت ئەمە لەسەر کەسێک بکەیت کە ڕۆڵەکەی بەرزترە یان یەکسانە لەگەڵ ڕۆڵی تۆ."
+    return None
+
+
+# ---- "No permission" replies (stay 10 seconds, then disappear) ----
+
+async def deny_interaction(interaction):
+    """Slash command used without permission."""
+    try:
+        await interaction.response.send_message(NO_PERM_TEXT, delete_after=10)
+    except Exception:
+        pass
+
+
+async def deny_message(message):
+    """Text command (mute / safika / bfra ...) used without permission."""
+    try:
+        await message.channel.send(f"{message.author.mention} {NO_PERM_TEXT}", delete_after=10)
+    except Exception:
+        pass
+
+
+def looks_like_command(message, parts, command):
+    """True only when the message really looks like a command attempt,
+    so normal chat that merely contains the word 'mute' does not get an error."""
+    first = parts[0].lower()
+    if first == command or (command == "safika" and first.startswith("safika")):
+        return True
+    return bool(message.mentions or message.reference)
+
+
+# ---- Bans done by the bot's own commands (so the log shows the real moderator) ----
+_recent_cmd_bans = {}   # (kind, user_id) -> (time, moderator mention)
+
+
+def mark_cmd_ban(kind, user_id, by_mention):
+    _recent_cmd_bans[(kind, user_id)] = (time.time(), by_mention)
+
+
+def cmd_ban_by(kind, user_id):
+    item = _recent_cmd_bans.get((kind, user_id))
+    if item and time.time() - item[0] < 30:
+        return item[1]
     return None
 
 
@@ -279,12 +342,23 @@ async def on_ready():
 
 
 # =========================================================
-# 6. WELCOME
+# 6. WELCOME + AUTOROLE
 # =========================================================
 
 @bot.event
 async def on_member_join(member):
     c = cfg(member.guild.id)
+
+    # ---- Autorole ----
+    autorole_id = c.get("autorole")
+    if autorole_id:
+        auto_role = member.guild.get_role(autorole_id)
+        if auto_role:
+            try:
+                await member.add_roles(auto_role, reason="Autorole")
+            except Exception as e:
+                print(f"autorole error: {e}")
+
     channel_id = c["channels"].get("welcome")
     channel = member.guild.get_channel(channel_id) if channel_id else None
 
@@ -712,10 +786,15 @@ async def on_voice_state_update(member, before, after):
 
 @bot.event
 async def on_member_ban(guild, user):
-    entry = await get_audit_executor(guild, discord.AuditLogAction.ban, user.id)
+    # ئەگەر بە کۆماندی Bfra بوو، ناوی ئەو کەسە دەنووسرێت کە نووسیویەتی (نەک بۆتەکە)
+    by = cmd_ban_by("ban", user.id)
+    if not by:
+        entry = await get_audit_executor(guild, discord.AuditLogAction.ban, user.id)
+        by = who(entry)
+
     embed = make_embed(
         "🔨 Member Banned",
-        f"**Member:** {user.mention}\n**Banned By:** {who(entry)}",
+        f"**Member:** {user.mention}\n**Banned By:** {by}",
         discord.Color.red()
     )
     add_user_thumbnail(embed, user)
@@ -724,10 +803,14 @@ async def on_member_ban(guild, user):
 
 @bot.event
 async def on_member_unban(guild, user):
-    entry = await get_audit_executor(guild, discord.AuditLogAction.unban, user.id)
+    by = cmd_ban_by("unban", user.id)
+    if not by:
+        entry = await get_audit_executor(guild, discord.AuditLogAction.unban, user.id)
+        by = who(entry)
+
     embed = make_embed(
         "♻ Member Unbanned",
-        f"**Member:** {user.mention}\n**Unbanned By:** {who(entry)}",
+        f"**Member:** {user.mention}\n**Unbanned By:** {by}",
         discord.Color.green()
     )
     add_user_thumbnail(embed, user)
@@ -857,6 +940,8 @@ async def on_message(message):
     # ---------------- SAFIKA ----------------
     if command == "safika":
         if not has_cmd_access(message.author, "safika"):
+            if looks_like_command(message, parts, command):
+                await deny_message(message)
             return
 
         amount = parse_safika_amount(parts)
@@ -885,6 +970,8 @@ async def on_message(message):
     # ---------------- MUTE ----------------
     if command == "mute":
         if not has_cmd_access(message.author, "mute"):
+            if looks_like_command(message, parts, command):
+                await deny_message(message)
             return
 
         target = await get_target_member(message)
@@ -916,7 +1003,8 @@ async def on_message(message):
                 await message.delete()
             except Exception:
                 pass
-            await message.channel.send(f"damt daxaa {target.mention}", delete_after=2)
+            # نامەکە دەمێنێتەوە (دیلیت نابێت)
+            await message.channel.send(f"damt daxaa {target.mention}")
         except discord.Forbidden:
             await message.channel.send(
                 "❌ بۆتەکە مۆڵەتی Manage Roles ی نییە، یان ڕۆڵی بۆتەکە لە **Roles** دا لە خوار ڕۆڵی Muted یان ئەو کەسەیە. ڕۆڵی بۆتەکە بەرز بکەرەوە.",
@@ -930,6 +1018,8 @@ async def on_message(message):
     # ---------------- UNMUTE ----------------
     if command == "unmute":
         if not has_cmd_access(message.author, "mute"):
+            if looks_like_command(message, parts, command):
+                await deny_message(message)
             return
 
         target = await get_target_member(message)
@@ -952,9 +1042,9 @@ async def on_message(message):
                 await message.delete()
             except Exception:
                 pass
+            # نامەکە دەمێنێتەوە (دیلیت نابێت)
             await message.channel.send(
-                f"xwa xerm bnwse dllm basha aqllba amjara {target.mention}",
-                delete_after=2
+                f"xwa xerm bnwse dllm basha aqllba amjara {target.mention}"
             )
         except discord.Forbidden:
             await message.channel.send(
@@ -969,6 +1059,8 @@ async def on_message(message):
     # ---------------- BFRA ----------------
     if command == "bfra":
         if not has_cmd_access(message.author, "ban"):
+            if looks_like_command(message, parts, command):
+                await deny_message(message)
             return
 
         target = await get_target_member(message)
@@ -988,12 +1080,16 @@ async def on_message(message):
             if reason:
                 await message.channel.send(reason, delete_after=15)
                 return
-            await target.ban(reason=f"Banned by {message.author}")
+            # ناوی ئەو کەسە لە لۆگ دەنووسرێت کە Bfra ی نووسیوە
+            mark_cmd_ban("ban", target.id, message.author.mention)
+            # چاتی کەسە باندکراوەکە ناسڕدرێتەوە
+            await target.ban(reason=f"Banned by {message.author}", delete_message_seconds=0)
             try:
                 await message.delete()
             except Exception:
                 pass
-            await message.channel.send(f"Frenraa✈️ {target.mention}", delete_after=2)
+            # نامەکە دەمێنێتەوە (دیلیت نابێت)
+            await message.channel.send(f"Frenraa✈️ {target.mention}")
         except discord.Forbidden:
             await message.channel.send(
                 "❌ بۆتەکە مۆڵەتی Ban Members ی نییە، یان ڕۆڵی بۆتەکە لە خوار ڕۆڵی ئەو کەسەیە. ڕۆڵی بۆتەکە بەرز بکەرەوە.",
@@ -1007,6 +1103,8 @@ async def on_message(message):
     # ---------------- UNBAN ----------------
     if command == "unban":
         if not has_cmd_access(message.author, "ban"):
+            if looks_like_command(message, parts, command):
+                await deny_message(message)
             return
 
         user_id = None
@@ -1021,6 +1119,7 @@ async def on_message(message):
 
         try:
             user = await bot.fetch_user(user_id)
+            mark_cmd_ban("unban", user_id, message.author.mention)
             await message.guild.unban(user)
             try:
                 await message.delete()
@@ -1086,7 +1185,7 @@ async def welcome_cmd(
     image: str = None
 ):
     if not is_dev(interaction.user):
-        await interaction.response.send_message("❌ تەنها خاوەنی سێرڤەر و ڕۆڵی دیڤیلۆپەر.", ephemeral=True)
+        await deny_interaction(interaction)
         return
 
     c = cfg(interaction.guild.id)
@@ -1129,7 +1228,7 @@ async def setlog(
     channel: discord.TextChannel
 ):
     if not is_dev(interaction.user):
-        await interaction.response.send_message("❌ تەنها خاوەنی سێرڤەر و ڕۆڵی دیڤیلۆپەر.", ephemeral=True)
+        await deny_interaction(interaction)
         return
 
     cfg(interaction.guild.id)["channels"][type] = channel.id
@@ -1146,7 +1245,7 @@ async def setlog(
 @app_commands.describe(channel="کەناڵی هەموو لۆگەکان")
 async def setlogall(interaction: discord.Interaction, channel: discord.TextChannel):
     if not is_dev(interaction.user):
-        await interaction.response.send_message("❌ تەنها خاوەنی سێرڤەر و ڕۆڵی دیڤیلۆپەر.", ephemeral=True)
+        await deny_interaction(interaction)
         return
 
     c = cfg(interaction.guild.id)
@@ -1163,23 +1262,23 @@ async def setlogall(interaction: discord.Interaction, channel: discord.TextChann
 @bot.tree.command(name="setstaff", description="دیاریکردنی ڕۆڵەکانی ستاف بۆ /staff")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
-@app_commands.describe(slot="ژمارەی ڕۆڵ", role="ڕۆڵەکە")
+@app_commands.describe(slot="جۆری ستاف", role="ڕۆڵەکە")
 @app_commands.choices(
     slot=[
-        app_commands.Choice(name="Staff Role 1", value="staff1"),
-        app_commands.Choice(name="Staff Role 2", value="staff2"),
+        app_commands.Choice(name="Lady Staff", value="staff1"),
+        app_commands.Choice(name="Boy Staff", value="staff2"),
     ]
 )
 async def setstaff(interaction: discord.Interaction, slot: str, role: discord.Role):
     if not is_dev(interaction.user):
-        await interaction.response.send_message("❌ تەنها خاوەنی سێرڤەر و ڕۆڵی دیڤیلۆپەر.", ephemeral=True)
+        await deny_interaction(interaction)
         return
 
     cfg(interaction.guild.id)["roles"][slot] = role.id
     save_config()
 
     await interaction.response.send_message(
-        f"✅ {slot} → **{role.name}**", ephemeral=True
+        f"✅ {STAFF_LABELS.get(slot, slot)} → **{role.name}**", ephemeral=True
     )
 
 
@@ -1195,7 +1294,7 @@ async def setstaff(interaction: discord.Interaction, slot: str, role: discord.Ro
 )
 async def regri_roles(interaction: discord.Interaction, action: str, role: discord.Role):
     if not is_dev(interaction.user):
-        await interaction.response.send_message("❌ تەنها خاوەنی سێرڤەر و ڕۆڵی دیڤیلۆپەر.", ephemeral=True)
+        await deny_interaction(interaction)
         return
 
     c = cfg(interaction.guild.id)
@@ -1214,15 +1313,13 @@ async def regri_roles(interaction: discord.Interaction, action: str, role: disco
 
 
 # ---------------------------------------------------------
-# /rolemute  /roleban  /rolesafika
+# /rolemute  /roleban  /rolesafika  /rolestaff
 # ---------------------------------------------------------
 
 async def update_perm_role(interaction, key, action, role):
     user = interaction.user
     if not is_dev(user):
-        await interaction.response.send_message(
-            "❌ تەنها خاوەنی سێرڤەر و ڕۆڵی دیڤیلۆپەر.", ephemeral=True
-        )
+        await deny_interaction(interaction)
         return
 
     c = cfg(interaction.guild.id)
@@ -1278,15 +1375,22 @@ async def rolesafika(interaction: discord.Interaction, action: str, role: discor
     await update_perm_role(interaction, "safika", action, role)
 
 
+@bot.tree.command(name="rolestaff", description="دیاریکردنی ئەو ڕۆڵانەی دەتوانن /staff بەکاربهێنن")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(action="زیادکردن یان لابردن", role="ڕۆڵەکە")
+@app_commands.choices(action=PERM_ACTION_CHOICES)
+async def rolestaff(interaction: discord.Interaction, action: str, role: discord.Role):
+    await update_perm_role(interaction, "staff", action, role)
+
+
 @bot.tree.command(name="setmuterole", description="دیاریکردنی ئەو ڕۆڵەی لە کاتی Mute دەدرێت بە کەسەکە")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(role="ڕۆڵی Mute (بۆ نموونە Muted)")
 async def setmuterole(interaction: discord.Interaction, role: discord.Role):
     if not is_dev(interaction.user):
-        await interaction.response.send_message(
-            "❌ تەنها خاوەنی سێرڤەر و ڕۆڵی دیڤیلۆپەر.", ephemeral=True
-        )
+        await deny_interaction(interaction)
         return
 
     if role.is_default() or role.managed:
@@ -1312,15 +1416,63 @@ async def setmuterole(interaction: discord.Interaction, role: discord.Role):
     )
 
 
+@bot.tree.command(name="autorole", description="دیاریکردنی ڕۆڵێک کە خۆکارانە بدرێت بە ئەندامی نوێ")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(action="دانان یان لابردن", role="ڕۆڵەکە (بۆ Set پێویستە)")
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="Set (دانان)", value="set"),
+        app_commands.Choice(name="Off (لابردن)", value="off"),
+    ]
+)
+async def autorole_cmd(interaction: discord.Interaction, action: str, role: discord.Role = None):
+    if not is_dev(interaction.user):
+        await deny_interaction(interaction)
+        return
+
+    c = cfg(interaction.guild.id)
+
+    if action == "off":
+        c["autorole"] = None
+        save_config()
+        await interaction.response.send_message("✅ Autorole لابرا.", ephemeral=True)
+        return
+
+    if role is None:
+        await interaction.response.send_message(
+            "❌ ڕۆڵەکە دیاری بکە: `/autorole set @role`", ephemeral=True
+        )
+        return
+
+    if role.is_default() or role.managed:
+        await interaction.response.send_message(
+            "❌ ئەم ڕۆڵە ناکرێت وەک Autorole بەکاربێت.", ephemeral=True
+        )
+        return
+
+    c["autorole"] = role.id
+    save_config()
+
+    warn = ""
+    me = interaction.guild.me
+    if role >= me.top_role:
+        warn = f"\n⚠ ڕۆڵی بۆتەکە (**{me.top_role.name}**) دەبێت لە سەروو ئەم ڕۆڵەوە بێت لە Roles، دەنا نایدات."
+
+    await interaction.response.send_message(
+        f"✅ Autorole: {role.mention} — ئەندامی نوێ خۆکارانە ئەم ڕۆڵە وەردەگرێت.{warn}",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
 @bot.tree.command(name="setdev", description="دیاریکردنی ڕۆڵی دیڤیلۆپەر (تەنها خاوەنی سێرڤەر)")
 @app_commands.guild_only()
 @app_commands.describe(action="زیادکردن یان لابردن", role="ڕۆڵی دیڤیلۆپەر")
 @app_commands.choices(action=PERM_ACTION_CHOICES)
 async def setdev(interaction: discord.Interaction, action: str, role: discord.Role):
     if interaction.user.id != interaction.guild.owner_id:
-        await interaction.response.send_message(
-            "❌ تەنها خاوەنی سێرڤەر دەتوانێت ڕۆڵی دیڤیلۆپەر دیاری بکات.", ephemeral=True
-        )
+        await deny_interaction(interaction)
         return
 
     c = cfg(interaction.guild.id)
@@ -1345,7 +1497,7 @@ async def setdev(interaction: discord.Interaction, action: str, role: discord.Ro
 @app_commands.default_permissions(administrator=True)
 async def config_cmd(interaction: discord.Interaction):
     if not is_dev(interaction.user):
-        await interaction.response.send_message("❌ تەنها خاوەنی سێرڤەر و ڕۆڵی دیڤیلۆپەر.", ephemeral=True)
+        await deny_interaction(interaction)
         return
 
     c = cfg(interaction.guild.id)
@@ -1357,7 +1509,7 @@ async def config_cmd(interaction: discord.Interaction):
 
     for slot in ("staff1", "staff2"):
         rid = c["roles"].get(slot)
-        lines.append(f"**{slot}:** {f'<@&{rid}>' if rid else '❌'}")
+        lines.append(f"**{STAFF_LABELS[slot]}:** {f'<@&{rid}>' if rid else '❌'}")
 
     regri = ", ".join(f"<@&{r}>" for r in c["regri_roles"]) or "❌"
     lines.append(f"**Regri roles:** {regri}")
@@ -1367,6 +1519,9 @@ async def config_cmd(interaction: discord.Interaction):
 
     mrid = c.get("mute_role")
     lines.append(f"**Mute role:** {f'<@&{mrid}>' if mrid else '❌ (Muted بە ناو)'}")
+
+    arid = c.get("autorole")
+    lines.append(f"**Autorole:** {f'<@&{arid}>' if arid else '❌'}")
 
     for k, label in PERM_LABELS.items():
         roles_txt = ", ".join(f"<@&{r}>" for r in c["perm_roles"][k]) or "❌"
@@ -1387,8 +1542,8 @@ async def config_cmd(interaction: discord.Interaction):
 @app_commands.guild_only()
 @app_commands.choices(
     role_choice=[
-        app_commands.Choice(name="Staff Role 1", value="staff1"),
-        app_commands.Choice(name="Staff Role 2", value="staff2"),
+        app_commands.Choice(name="Lady Staff", value="staff1"),
+        app_commands.Choice(name="Boy Staff", value="staff2"),
     ]
 )
 async def staff(
@@ -1396,10 +1551,8 @@ async def staff(
     member: discord.Member,
     role_choice: str
 ):
-    if not is_dev(interaction.user):
-        await interaction.response.send_message(
-            "❌ تەنها خاوەنی سێرڤەر و ڕۆڵی دیڤیلۆپەر دەتوانێت ئەم کۆماندە بەکاربهێنێت.", ephemeral=True
-        )
+    if not has_staff_access(interaction.user):
+        await deny_interaction(interaction)
         return
 
     try:
@@ -1439,9 +1592,7 @@ async def staff(
 )
 async def rangi_role(interaction: discord.Interaction, role: str, color: str):
     if not is_dev(interaction.user):
-        await interaction.response.send_message(
-            "❌ تەنها خاوەنی سێرڤەر و ڕۆڵی دیڤیلۆپەر دەتوانێت ئەم کۆماندە بەکاربهێنێت.", ephemeral=True
-        )
+        await deny_interaction(interaction)
         return
 
     guild = interaction.guild
@@ -1536,10 +1687,7 @@ async def regri(interaction: discord.Interaction, member: discord.Member, action
     has_allowed_role = any(r.id in c["regri_roles"] for r in interaction.user.roles)
 
     if not is_owner and not has_allowed_role:
-        await interaction.response.send_message(
-            "❌ تەنها ڕۆڵە دیاریکراوەکان و خاوەنی سێرڤەر دەتوانن ئەم کۆماندە بەکاربهێنن.",
-            ephemeral=True
-        )
+        await deny_interaction(interaction)
         return
 
     if action.lower() == "add":
