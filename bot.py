@@ -371,8 +371,8 @@ async def on_ready():
         except Exception:
             pass
 
-    print(f"بۆتەکە بە سەرکەوتوویی چالاک بوو وەک: {bot.user}")
-    print(f"Config file: {CONFIG_FILE}")
+    print(f"بۆتەکە بە سەرکەوتوویی چالاک بوو وەک: {bot.user}", flush=True)
+    print(f"Config file: {CONFIG_FILE}", flush=True)
 
 
 # =========================================================
@@ -2818,5 +2818,4 @@ class DominoHandView(discord.ui.View):
     def __init__(self, game, uid):
         super().__init__(timeout=600)
         if game.finished or game.current() != uid:
-            return
-        
+   
