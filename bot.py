@@ -244,6 +244,21 @@ def cmd_ban_by(kind, user_id):
     return None
 
 
+# ---- Role edits done by the bot's own commands (so the log shows the real person) ----
+_recent_cmd_role_edits = {}   # role_id -> (time, user mention)
+
+
+def mark_cmd_role_edit(role_id, by_mention):
+    _recent_cmd_role_edits[role_id] = (time.time(), by_mention)
+
+
+def cmd_role_edit_by(role_id):
+    item = _recent_cmd_role_edits.get(role_id)
+    if item and time.time() - item[0] < 30:
+        return item[1]
+    return None
+
+
 # =========================================================
 # 3. LOG HELPERS
 # =========================================================
@@ -698,12 +713,20 @@ async def on_guild_role_update(before, after):
         changes.append(f"**Position:** `{before.position}` → `{after.position}`")
 
     if changes:
-        entry = await get_audit_executor(after.guild, discord.AuditLogAction.role_update, after.id)
+        cmd_by = cmd_role_edit_by(after.id)
+        if cmd_by:
+            updated_by = cmd_by
+            via_line = "**Via:** Bot command (/rangi-role)\n"
+        else:
+            entry = await get_audit_executor(after.guild, discord.AuditLogAction.role_update, after.id)
+            updated_by = who(entry)
+            via_line = ""
         embed = make_embed(
             "✏️ Role Updated",
             f"**Role:** {after.mention}\n"
             f"**ID:** `{after.id}`\n"
-            f"**Updated By:** {who(entry)}\n\n"
+            f"**Updated By:** {updated_by}\n"
+            f"{via_line}\n"
             + "\n".join(changes),
             discord.Color.gold()
         )
@@ -1658,10 +1681,10 @@ def parse_hex_color(text):
 @bot.tree.command(name="rangi-role", description="گۆڕینی ڕەنگی ڕۆڵ")
 @app_commands.guild_only()
 @app_commands.describe(
-    role="ناوی ڕۆڵەکە بنووسە یان هەڵبژێرە",
+    role="ڕۆڵەکە هەڵبژێرە",
     color="کۆدی ڕەنگ بۆ نموونە #FF0000"
 )
-async def rangi_role(interaction: discord.Interaction, role: str, color: str):
+async def rangi_role(interaction: discord.Interaction, role: discord.Role, color: str):
     if not has_color_access(interaction.user):
         await deny_interaction(interaction)
         return
@@ -1674,14 +1697,7 @@ async def rangi_role(interaction: discord.Interaction, role: str, color: str):
         )
         return
 
-    if role.isdigit():
-        target_role = guild.get_role(int(role))
-    else:
-        target_role = discord.utils.get(guild.roles, name=role)
-
-    if not target_role:
-        await interaction.response.send_message("❌ ڕۆڵەکە نەدۆزرایەوە!", ephemeral=True)
-        return
+    target_role = role
 
     user_top_role = interaction.user.top_role
     is_owner = interaction.user.id == guild.owner_id
@@ -1720,6 +1736,7 @@ async def rangi_role(interaction: discord.Interaction, role: str, color: str):
         return
 
     try:
+        mark_cmd_role_edit(target_role.id, interaction.user.mention)
         await target_role.edit(
             color=color_obj,
             reason=f"Color changed by {interaction.user}"
@@ -1735,32 +1752,6 @@ async def rangi_role(interaction: discord.Interaction, role: str, color: str):
         )
     except Exception as e:
         await interaction.response.send_message(f"❌ هەڵە ڕوویدا: {e}", ephemeral=True)
-
-
-@rangi_role.autocomplete("role")
-async def rangi_role_autocomplete(interaction: discord.Interaction, current: str):
-    guild = interaction.guild
-    if not guild or not has_color_access(interaction.user):
-        return []
-
-    user_top_role = interaction.user.top_role
-    is_owner = interaction.user.id == guild.owner_id
-    me = guild.me
-    options = []
-
-    for r in guild.roles:
-        if r.is_default() or r.managed or r.is_bot_managed():
-            continue
-        if not is_owner and r > user_top_role:
-            continue
-        if r >= me.top_role:
-            continue
-        if current.lower() in r.name.lower():
-            options.append(app_commands.Choice(name=r.name[:100], value=str(r.id)))
-            if len(options) >= 25:
-                break
-
-    return options
 
 
 # =========================================================
