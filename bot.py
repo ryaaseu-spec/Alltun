@@ -358,9 +358,10 @@ async def log_mute_event(guild, target, by, muted, channel=None, via=None):
 @bot.event
 async def on_ready():
     try:
-        await bot.tree.sync()
-    except Exception:
-        pass
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} slash commands", flush=True)
+    except Exception as e:
+        print(f"❌ Slash sync error: {e}", flush=True)
 
     for guild in bot.guilds:
         try:
@@ -2818,6 +2819,4 @@ class DominoHandView(discord.ui.View):
         super().__init__(timeout=600)
         if game.finished or game.current() != uid:
             return
-        playable = game.playable_tiles(uid)
-        if playable:
-            self.add_item(DominoTileSelect(game, uid, playable))
+        
