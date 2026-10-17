@@ -2476,19 +2476,6 @@ async def security_cmd(interaction: discord.Interaction):
     )
 
 
-# =========================================================
-# 29.9 LOAD EXTENSIONS (domino.py)
-# =========================================================
-
-async def _setup_hook():
-    try:
-        await bot.load_extension("domino")
-    except Exception as e:
-        print(f"❌ domino load error: {e}", flush=True)
-
-
-bot.setup_hook = _setup_hook
-
 
 # =========================================================
 # 30. RUN
