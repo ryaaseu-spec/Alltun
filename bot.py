@@ -86,6 +86,8 @@ def cfg(guild_id):
     d.setdefault("roles", {})          # staff1, staff2
     d.setdefault("regri_roles", [])    # roles allowed to use /regri
     d.setdefault("restricted", [])     # users blocked from color change
+    d.setdefault("color_roles", [])    # roles allowed to use /rangi-role (/regadan-ranggorin)
+    d.setdefault("color_users", [])    # specific users allowed to use /rangi-role (/regadan-ranggorin)
     d.setdefault("welcome_text", "Baxer beyt")
     d.setdefault("welcome_image", None)  # image / gif link shown under the welcome text
     d.setdefault("dev_roles", [])      # developer roles (full control like owner)
@@ -128,6 +130,19 @@ def has_staff_access(member):
             return True
         allowed = cfg(member.guild.id)["perm_roles"].get("staff", [])
         return any(r.id in allowed for r in member.roles)
+    except Exception:
+        return False
+
+
+def has_color_access(member):
+    """Owner + developer roles + roles/users chosen with /regadan-ranggorin"""
+    try:
+        if is_dev(member):
+            return True
+        c = cfg(member.guild.id)
+        if member.id in c["color_users"]:
+            return True
+        return any(r.id in c["color_roles"] for r in member.roles)
     except Exception:
         return False
 
@@ -1289,7 +1304,9 @@ async def regri_roles(interaction: discord.Interaction, action: str, role: disco
         msg = f"✅ {role.mention} لابرا."
 
     save_config()
-    await interaction.response.send_message(msg, ephemeral=True)
+    await interaction.response.send_message(
+        msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
+    )
 
 
 # ---------------------------------------------------------
@@ -1491,8 +1508,13 @@ async def config_cmd(interaction: discord.Interaction):
         rid = c["roles"].get(slot)
         lines.append(f"**{STAFF_LABELS[slot]}:** {f'<@&{rid}>' if rid else '❌'}")
 
-    regri = ", ".join(f"<@&{r}>" for r in c["regri_roles"]) or "❌"
-    lines.append(f"**Regri roles:** {regri}")
+    regri_txt = ", ".join(f"<@&{r}>" for r in c["regri_roles"]) or "❌"
+    lines.append(f"**Regri roles:** {regri_txt}")
+
+    color_roles_txt = ", ".join(f"<@&{r}>" for r in c["color_roles"]) or "❌"
+    color_users_txt = ", ".join(f"<@{u}>" for u in c["color_users"]) or "❌"
+    lines.append(f"**Color roles:** {color_roles_txt}")
+    lines.append(f"**Color users:** {color_users_txt}")
 
     dev = ", ".join(f"<@&{r}>" for r in c["dev_roles"]) or "❌ (تەنها Owner)"
     lines.append(f"**Developer roles:** {dev}")
@@ -1564,6 +1586,75 @@ async def staff(
 # 27. COLOR ROLE SYSTEM
 # =========================================================
 
+@bot.tree.command(
+    name="regadan-ranggorin",
+    description="ڕێگەپێدانی ڕۆڵ یان کەس بۆ گۆڕینی ڕەنگی ڕۆڵ"
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    action="زیادکردن یان لابردن",
+    role="ڕۆڵێک کە ڕێگەی پێبدرێت (ئارەزوومەندانە)",
+    member="کەسێکی تایبەت کە ڕێگەی پێبدرێت (ئارەزوومەندانە)"
+)
+@app_commands.choices(action=PERM_ACTION_CHOICES)
+async def regadan_ranggorin(
+    interaction: discord.Interaction,
+    action: str,
+    role: discord.Role = None,
+    member: discord.Member = None
+):
+    if not is_dev(interaction.user):
+        await deny_interaction(interaction)
+        return
+
+    if role is None and member is None:
+        await interaction.response.send_message(
+            "❌ دەبێت ڕۆڵێک یان کەسێک دیاری بکەیت.", ephemeral=True
+        )
+        return
+
+    c = cfg(interaction.guild.id)
+    lines = []
+
+    if role is not None:
+        if action == "add":
+            if role.id not in c["color_roles"]:
+                c["color_roles"].append(role.id)
+            lines.append(f"✅ {role.mention} ئێستا دەتوانێت ڕەنگی ڕۆڵ بگۆڕێت.")
+        else:
+            if role.id in c["color_roles"]:
+                c["color_roles"].remove(role.id)
+            lines.append(f"✅ {role.mention} لە ڕێگەپێدانی ڕەنگ لابرا.")
+
+    if member is not None:
+        if action == "add":
+            if member.id not in c["color_users"]:
+                c["color_users"].append(member.id)
+            lines.append(f"✅ {member.mention} ئێستا دەتوانێت ڕەنگی ڕۆڵ بگۆڕێت.")
+        else:
+            if member.id in c["color_users"]:
+                c["color_users"].remove(member.id)
+            lines.append(f"✅ {member.mention} لە ڕێگەپێدانی ڕەنگ لابرا.")
+
+    save_config()
+    await interaction.response.send_message(
+        "\n".join(lines),
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
+def parse_hex_color(text):
+    """'#FF0000' / 'ff0000' / '#f00' -> discord.Color, or None if invalid."""
+    h = text.strip().lstrip("#")
+    if len(h) == 3 and all(ch in "0123456789abcdefABCDEF" for ch in h):
+        h = "".join(ch * 2 for ch in h)
+    if len(h) != 6 or not all(ch in "0123456789abcdefABCDEF" for ch in h):
+        return None
+    return discord.Color(int(h, 16))
+
+
 @bot.tree.command(name="rangi-role", description="گۆڕینی ڕەنگی ڕۆڵ")
 @app_commands.guild_only()
 @app_commands.describe(
@@ -1571,7 +1662,7 @@ async def staff(
     color="کۆدی ڕەنگ بۆ نموونە #FF0000"
 )
 async def rangi_role(interaction: discord.Interaction, role: str, color: str):
-    if not is_dev(interaction.user):
+    if not has_color_access(interaction.user):
         await deny_interaction(interaction)
         return
 
@@ -1596,7 +1687,7 @@ async def rangi_role(interaction: discord.Interaction, role: str, color: str):
     is_owner = interaction.user.id == guild.owner_id
 
     if (
-        target_role.name == "@everyone"
+        target_role.is_default()
         or target_role.managed
         or target_role.is_bot_managed()
     ):
@@ -1612,36 +1703,60 @@ async def rangi_role(interaction: discord.Interaction, role: str, color: str):
         )
         return
 
+    me = guild.me
+    if target_role >= me.top_role:
+        await interaction.response.send_message(
+            f"❌ ڕۆڵی بۆتەکە (**{me.top_role.name}**) دەبێت لە سەروو ڕۆڵی **{target_role.name}** بێت. "
+            f"لە Server Settings ← Roles ڕۆڵی بۆتەکە بەرز بکەرەوە.",
+            ephemeral=True
+        )
+        return
+
+    color_obj = parse_hex_color(color)
+    if color_obj is None:
+        await interaction.response.send_message(
+            "❌ کۆدی ڕەنگ هەڵەیە. نموونە: `#FF0000`", ephemeral=True
+        )
+        return
+
     try:
-        color_obj = discord.Color(int(color.strip().lstrip("#"), 16))
-        await target_role.edit(color=color_obj)
+        await target_role.edit(
+            color=color_obj,
+            reason=f"Color changed by {interaction.user}"
+        )
         await interaction.response.send_message(
             f"✅ ڕەنگی ڕۆڵی **{target_role.name}** بە سەرکەوتوویی گۆڕدرا!",
             ephemeral=True
         )
-    except Exception as e:
+    except discord.Forbidden:
         await interaction.response.send_message(
-            f"❌ هەڵە لە نووسینی کۆدی ڕەنگەکەدا هەیە: {e}", ephemeral=True
+            "❌ بۆتەکە مۆڵەتی **Manage Roles** ی نییە، یان ڕۆڵەکەی لە خوار ئەم ڕۆڵەیە.",
+            ephemeral=True
         )
+    except Exception as e:
+        await interaction.response.send_message(f"❌ هەڵە ڕوویدا: {e}", ephemeral=True)
 
 
 @rangi_role.autocomplete("role")
 async def rangi_role_autocomplete(interaction: discord.Interaction, current: str):
     guild = interaction.guild
-    if not guild:
+    if not guild or not has_color_access(interaction.user):
         return []
 
     user_top_role = interaction.user.top_role
     is_owner = interaction.user.id == guild.owner_id
+    me = guild.me
     options = []
 
     for r in guild.roles:
-        if r.name == "@everyone" or r.managed or r.is_bot_managed():
+        if r.is_default() or r.managed or r.is_bot_managed():
             continue
         if not is_owner and r > user_top_role:
             continue
+        if r >= me.top_role:
+            continue
         if current.lower() in r.name.lower():
-            options.append(app_commands.Choice(name=r.name, value=str(r.id)))
+            options.append(app_commands.Choice(name=r.name[:100], value=str(r.id)))
             if len(options) >= 25:
                 break
 
