@@ -2478,21 +2478,6 @@ async def security_cmd(interaction: discord.Interaction):
 
 
 # =========================================================
-# 29b. MUSIC (/gorani) — music.py
-# =========================================================
-
-async def _load_music_extension():
-    try:
-        await bot.load_extension("music")
-        print("🎵 music.py بار کرا", flush=True)
-    except Exception as e:
-        print(f"❌ music.py بار نەکرا: {e}", flush=True)
-
-
-bot.setup_hook = _load_music_extension
-
-
-# =========================================================
 # 30. RUN
 # =========================================================
 
