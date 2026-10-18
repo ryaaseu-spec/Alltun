@@ -122,6 +122,25 @@ def _ensure_opus():
             continue
 
 
+async def reply_temp(interaction, delay=10, **kwargs):
+    """followup message that deletes itself after `delay` seconds."""
+    try:
+        msg = await interaction.followup.send(wait=True, **kwargs)
+    except Exception as e:
+        print(f"[music] followup failed: {e}", flush=True)
+        return
+
+    async def _later():
+        await asyncio.sleep(delay)
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+    asyncio.create_task(_later())
+
+
+
 @dataclass
 class Track:
     title: str
@@ -610,8 +629,8 @@ class Music(commands.Cog):
         except Exception as e:
             reason = f"{type(e).__name__}: {e}"[:300]
             print(f"[music] search failed: {reason}", flush=True)
-            await interaction.followup.send(
-                f"نەتوانرا گۆرانییەکە بدۆزرێتەوە ✧\n```{reason}```", delete_after=30
+            await reply_temp(
+                interaction, 30, content=f"نەتوانرا گۆرانییەکە بدۆزرێتەوە ✧\n```{reason}```"
             )
             return
         print("[music] search ok", flush=True)
@@ -632,8 +651,8 @@ class Music(commands.Cog):
                     await guild.voice_client.disconnect(force=True)
             except Exception:
                 pass
-            await interaction.followup.send(
-                f"نەتوانرا بچمە ناو ڤۆیس ✧\n```{reason}```", delete_after=30
+            await reply_temp(
+                interaction, 30, content=f"نەتوانرا بچمە ناو ڤۆیس ✧\n```{reason}```"
             )
             return
         print("[music] connected", flush=True)
@@ -655,7 +674,7 @@ class Music(commands.Cog):
             text = f"♡ زیادکرا بۆ لیست  **{clean_title(track.title, 60)}**\n-# #{position} · `{fmt_time(track.duration)}`"
         else:
             text = f"✧ دەست پێدەکات  **{clean_title(track.title, 60)}**"
-        await interaction.followup.send(embed=discord.Embed(description=text, color=PINK), delete_after=8)
+        await reply_temp(interaction, 8, embed=discord.Embed(description=text, color=PINK))
 
 
 async def setup(bot):
