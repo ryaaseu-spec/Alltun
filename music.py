@@ -604,24 +604,39 @@ class Music(commands.Cog):
         await interaction.response.defer()
 
         # 1) search
+        print(f"[music] search start: {query!r}", flush=True)
         try:
-            info = await asyncio.to_thread(_extract, query.strip())
+            info = await asyncio.wait_for(asyncio.to_thread(_extract, query.strip()), timeout=45)
         except Exception as e:
-            print(f"[music] search failed: {e}", flush=True)
-            await interaction.followup.send("نەتوانرا گۆرانییەکە بدۆزرێتەوە ✧", delete_after=10)
+            reason = f"{type(e).__name__}: {e}"[:300]
+            print(f"[music] search failed: {reason}", flush=True)
+            await interaction.followup.send(
+                f"نەتوانرا گۆرانییەکە بدۆزرێتەوە ✧\n```{reason}```", delete_after=30
+            )
             return
+        print("[music] search ok", flush=True)
         track = info_to_track(info, user.display_name)
 
         # 2) connect
+        print("[music] connecting to voice", flush=True)
         try:
             if vc is None:
-                vc = await channel.connect(self_deaf=True, timeout=30)
+                vc = await asyncio.wait_for(channel.connect(self_deaf=True, timeout=30), timeout=45)
             elif vc.channel.id != channel.id:
                 await vc.move_to(channel)
         except Exception as e:
-            print(f"[music] connect failed: {e}", flush=True)
-            await interaction.followup.send("نەتوانرا بچمە ناو ڤۆیس ✧", delete_after=10)
+            reason = f"{type(e).__name__}: {e}"[:300]
+            print(f"[music] connect failed: {reason}", flush=True)
+            try:
+                if guild.voice_client:
+                    await guild.voice_client.disconnect(force=True)
+            except Exception:
+                pass
+            await interaction.followup.send(
+                f"نەتوانرا بچمە ناو ڤۆیس ✧\n```{reason}```", delete_after=30
+            )
             return
+        print("[music] connected", flush=True)
 
         # 3) player
         player = self.players.get(guild.id)
