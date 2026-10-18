@@ -86,6 +86,8 @@ def _ytdl_options():
         "no_warnings": True,
         "source_address": "0.0.0.0",
         "socket_timeout": 20,
+        # clients that often work from server IPs without login / JS runtime
+        "extractor_args": {"youtube": {"player_client": ["android_vr", "tv", "web_safari"]}},
     }
     cookies = _cookie_file()
     if cookies:
@@ -116,11 +118,8 @@ def _extract(query):
     if query.startswith(("http://", "https://")):
         return _extract_one(query)
 
-    # Railway IPs are often blocked by YouTube; without cookies try SoundCloud first.
-    if _cookie_file():
-        order = ("ytsearch1:", "scsearch1:")
-    else:
-        order = ("scsearch1:", "ytsearch1:")
+    # YouTube first; SoundCloud only as a fallback if YouTube blocks the server.
+    order = ("ytsearch1:", "scsearch1:")
 
     errors = []
     for prefix in order:
