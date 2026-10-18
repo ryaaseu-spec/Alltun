@@ -93,9 +93,7 @@ def _ytdl_options():
     return opts
 
 
-def _extract(query):
-    """Blocking yt-dlp call (run it with asyncio.to_thread)."""
-    target = query if query.startswith(("http://", "https://")) else f"ytsearch1:{query}"
+def _extract_one(target):
     with yt_dlp.YoutubeDL(_ytdl_options()) as ydl:
         info = ydl.extract_info(target, download=False)
     if info is None:
@@ -106,8 +104,31 @@ def _extract(query):
             raise RuntimeError("no result")
         info = entries[0]
     if not info.get("url"):
-        raise RuntimeError("no stream url")
+        formats = [f for f in (info.get("formats") or []) if f.get("url")]
+        if not formats:
+            raise RuntimeError("no stream url")
+        info["url"] = formats[-1]["url"]
     return info
+
+
+def _extract(query):
+    """Blocking. URL -> direct. Text -> search YouTube + SoundCloud (fallback)."""
+    if query.startswith(("http://", "https://")):
+        return _extract_one(query)
+
+    # Railway IPs are often blocked by YouTube; without cookies try SoundCloud first.
+    if _cookie_file():
+        order = ("ytsearch1:", "scsearch1:")
+    else:
+        order = ("scsearch1:", "ytsearch1:")
+
+    errors = []
+    for prefix in order:
+        try:
+            return _extract_one(prefix + query)
+        except Exception as e:
+            errors.append(f"{prefix[:2]}: {str(e)[:120]}")
+    raise RuntimeError(" | ".join(errors))
 
 
 def _ensure_opus():
