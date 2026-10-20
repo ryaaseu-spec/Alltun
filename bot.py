@@ -2055,7 +2055,7 @@ async def sec_on_message(message):
 
     # ---- invite / link ----
     for key, rx in (("invite", SEC_INVITE_RX), ("link", SEC_LINK_RX)):
-        if mods[key]["enabled"] and rx.search(text):
+        if mods[key]["enabled"] and rx.search(text) and not is_partner_channel(message):
             await sec_safe_delete(message)
             done = await sec_register(
                 guild, uid, key,
@@ -2553,6 +2553,10 @@ async def panel_edit(interaction, ctx, kind):
     g, uid = ctx.guild, ctx.author_id
     if kind == "ar":
         await interaction.response.edit_message(embed=ar_embed(g), view=ArView(g, uid))
+    elif kind == "rkp":
+        await interaction.response.edit_message(embed=rkp_embed(g), view=RkPartnerView(g, uid))
+    elif kind == "bl":
+        await interaction.response.edit_message(embed=bl_embed(g), view=BlView(g, uid))
     else:
         await interaction.response.edit_message(embed=rk_embed(g), view=RkView(g, uid))
 
@@ -2568,8 +2572,9 @@ class PanelChannelSelect(discord.ui.ChannelSelect):
 
     async def callback(self, interaction):
         g = self.view.guild
-        store = get_ar(g.id) if self.kind == "ar" else get_rk(g.id)
-        store["channels"] = [c.id for c in self.values]
+        getter = {"ar": get_ar, "rk": get_rk, "rkp": get_rk, "bl": get_bl}[self.kind]
+        field = "partner_channels" if self.kind == "rkp" else "channels"
+        getter(g.id)[field] = [c.id for c in self.values]
         save_config()
         await panel_edit(interaction, self.view, self.kind)
 
@@ -2590,8 +2595,13 @@ class PanelRoleSelect(discord.ui.RoleSelect):
 # 33. AUTOREACT  (/autoreact)
 # =========================================================
 
-AR_MODE_ORDER = ["both", "image", "text"]
-AR_MODE_LABELS = {"both": "Text + Image", "image": "Image / GIF only", "text": "Text only"}
+AR_MODE_ORDER = ["all", "image", "video", "text"]
+AR_MODE_LABELS = {
+    "all": "Text + Image + Video",
+    "image": "Image / GIF only",
+    "video": "Video only",
+    "text": "Text only",
+}
 AR_MAX_EMOJIS = 20   # Discord: زۆرترین 20 ڕیاکت لەسەر هەر نامەیەک
 IMG_LINK_RX = re.compile(r"https?://\S+\.(?:png|jpe?g|gif|webp)(?:\?\S*)?|tenor\.com/|giphy\.com/", re.I)
 
@@ -2601,7 +2611,9 @@ def get_ar(gid):
     a.setdefault("enabled", True)
     a.setdefault("channels", [])
     a.setdefault("emojis", [])
-    a.setdefault("mode", "both")
+    a.setdefault("mode", "all")
+    if a["mode"] not in AR_MODE_LABELS:
+        a["mode"] = "all"
     return a
 
 
@@ -2631,6 +2643,21 @@ def msg_has_image(m):
     return bool(IMG_LINK_RX.search(m.content or ""))
 
 
+VIDEO_LINK_RX = re.compile(
+    r"https?://\S+\.(?:mp4|mov|webm|mkv)(?:\?\S*)?|youtu\.be/|youtube\.com/watch|streamable\.com/", re.I)
+
+
+def msg_has_video(m):
+    for a in m.attachments:
+        ct = (a.content_type or "").lower()
+        if ct.startswith("video/") or a.filename.lower().endswith((".mp4", ".mov", ".webm", ".mkv", ".avi")):
+            return True
+    for e in m.embeds:
+        if e.type == "video":
+            return True
+    return bool(VIDEO_LINK_RX.search(m.content or ""))
+
+
 async def ar_on_message(message):
     if message.author.bot or message.guild is None:
         return
@@ -2641,15 +2668,18 @@ async def ar_on_message(message):
     if ch.id not in a["channels"] and getattr(ch, "parent_id", None) not in a["channels"]:
         return
 
-    has_img = msg_has_image(message)
+    has_vid = msg_has_video(message)
+    has_img = msg_has_image(message) and not has_vid
     has_text = bool((message.content or "").strip())
     mode = a["mode"]
     if mode == "image":
         ok = has_img
+    elif mode == "video":
+        ok = has_vid
     elif mode == "text":
-        ok = has_text and not has_img
+        ok = has_text and not has_img and not has_vid
     else:
-        ok = has_img or has_text
+        ok = has_img or has_vid or has_text
     if not ok:
         return
 
@@ -2750,6 +2780,82 @@ class ArView(SecBaseView):
         await panel_edit(interaction, self, "ar")
 
 
+    @discord.ui.button(label="Pick by Reacting", style=discord.ButtonStyle.success, row=3)
+    async def pick_btn(self, interaction, button):
+        try:
+            view = ArPickView(self.guild, interaction.user.id)
+            msg = await interaction.channel.send(
+                f"{interaction.user.mention} 👇 ئیمۆجیەکان وەک ڕیاکت لەسەر ئەم نامەیە دابنێ "
+                f"(لە پیکەری ئیمۆجی خۆت هەڵیانبژێرە)، پاشان **Done** دابگرە.",
+                view=view
+            )
+        except Exception:
+            await interaction.response.send_message(
+                "❌ بۆتەکە ناتوانێت لەم کەناڵە بنووسێت.", ephemeral=True)
+            return
+        view.message = msg
+        _ar_pick[msg.id] = {"uid": interaction.user.id, "emojis": []}
+        await interaction.response.send_message(
+            "✅ نامەیەک نێردرا لە چاتەکە، ئیمۆجیەکان وەک ڕیاکت لەسەری دابنێ و Done دابگرە.",
+            ephemeral=True)
+
+
+_ar_pick = {}   # message_id -> {"uid": ..., "emojis": [...]}
+
+
+async def ar_on_raw_reaction(payload):
+    p = _ar_pick.get(payload.message_id)
+    if not p or payload.user_id != p["uid"]:
+        return
+    e = str(payload.emoji)
+    if e not in p["emojis"]:
+        p["emojis"].append(e)
+
+
+bot.add_listener(ar_on_raw_reaction, "on_raw_reaction_add")
+
+
+class ArPickView(SecBaseView):
+    def __init__(self, guild, author_id):
+        super().__init__(guild, author_id)
+        self.timeout = 180
+        self.message = None
+
+    async def on_timeout(self):
+        if self.message:
+            _ar_pick.pop(self.message.id, None)
+            try:
+                await self.message.delete()
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Done", style=discord.ButtonStyle.success)
+    async def done(self, interaction, button):
+        p = _ar_pick.pop(interaction.message.id, None)
+        a = get_ar(self.guild.id)
+        added = 0
+        for e in (p["emojis"] if p else []):
+            if e not in a["emojis"] and len(a["emojis"]) < AR_MAX_EMOJIS:
+                a["emojis"].append(e)
+                added += 1
+        save_config()
+        await interaction.response.send_message(
+            f"✅ `{added}` ئیمۆجی زیادکرا. `/autoreact` بکەرەوە بۆ بینین.", ephemeral=True)
+        try:
+            await interaction.message.delete()
+        except Exception:
+            pass
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction, button):
+        _ar_pick.pop(interaction.message.id, None)
+        await interaction.response.send_message("❌ هەڵوەشایەوە.", ephemeral=True)
+        try:
+            await interaction.message.delete()
+        except Exception:
+            pass
+
+
 @bot.tree.command(name="autoreact", description="ڕیاکتی خۆکار لە چەند کەناڵێک")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
@@ -2784,6 +2890,8 @@ def get_rk(gid):
     rk.setdefault("thumb", "avatar")     # "avatar" = وێنەی ئەو کەسەی Reklam ی نووسی
     rk.setdefault("footer", None)
     rk.setdefault("reply", False)
+    rk.setdefault("partner_enabled", True)
+    rk.setdefault("partner_channels", [])
     return rk
 
 
@@ -2982,6 +3090,12 @@ class RkView(SecBaseView):
         await panel_edit(interaction, self, "rk")
 
 
+    @discord.ui.button(label="Partner ›", style=discord.ButtonStyle.primary, row=4)
+    async def partner_btn(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=rkp_embed(self.guild), view=RkPartnerView(self.guild, self.author_id))
+
+
 @bot.tree.command(name="reklam", description="ڕێکخستنی نامەی Reklam")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
@@ -2992,6 +3106,201 @@ async def reklam_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(
         embed=rk_embed(interaction.guild),
         view=RkView(interaction.guild, interaction.user.id),
+        ephemeral=True
+    )
+
+
+# =========================================================
+# 35. PARTNER CHANNELS (لە /reklam ← Partner) + /blocklink
+# =========================================================
+
+LINK_ANY_RX = re.compile(r"https?://\S+|discord(?:app)?\.(?:gg|com/invite)/\S+|www\.\S+", re.I)
+
+
+def chat_exempt(member):
+    """Owner + Administrator + Developer roles are never touched by Partner / Blocklink."""
+    try:
+        return (member.id == member.guild.owner_id
+                or member.guild_permissions.administrator
+                or is_dev(member))
+    except Exception:
+        return False
+
+
+def is_partner_channel(message):
+    try:
+        rk = get_rk(message.guild.id)
+        if not rk["partner_enabled"]:
+            return False
+        ch = message.channel
+        return ch.id in rk["partner_channels"] or getattr(ch, "parent_id", None) in rk["partner_channels"]
+    except Exception:
+        return False
+
+
+def msg_has_attached_image(m):
+    for a in m.attachments:
+        ct = (a.content_type or "").lower()
+        if ct.startswith("image/") or a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+            return True
+    return bool(IMG_LINK_RX.search(m.content or ""))
+
+
+async def _delete_and_warn(message, text):
+    try:
+        await message.delete()
+    except Exception:
+        return
+    try:
+        await message.channel.send(f"{message.author.mention} ❌ {text}", delete_after=8)
+    except Exception:
+        pass
+
+
+async def pt_check(message):
+    if message.author.bot or message.guild is None:
+        return
+    if not is_partner_channel(message) or chat_exempt(message.author):
+        return
+    if msg_has_attached_image(message):
+        await _delete_and_warn(message, "نابێت وێنە لێرە بنێریت.")
+    elif not SEC_INVITE_RX.search(message.content or ""):
+        await _delete_and_warn(
+            message, "ناتوانیت تێکست لێرە دابنێیت، دەبێت لەگەڵ تێکستەکە لینکی سێرڤەر هەبێت.")
+
+
+async def pt_on_message(message):
+    await pt_check(message)
+
+
+async def pt_on_edit(before, after):
+    await pt_check(after)
+
+
+bot.add_listener(pt_on_message, "on_message")
+bot.add_listener(pt_on_edit, "on_message_edit")
+
+
+def rkp_embed(guild):
+    rk = get_rk(guild.id)
+    e = discord.Embed(
+        title="🤝 Partner Channels " + ("(ON)" if rk["partner_enabled"] else "(OFF)"),
+        description="\n".join(f"<#{c}>" for c in rk["partner_channels"])[:3000] or "❌ هیچ کەناڵێک دیاری نەکراوە",
+        color=discord.Color.green() if rk["partner_enabled"] else discord.Color.red()
+    )
+    e.set_footer(text="تەنها نامەی لەگەڵ لینکی سێرڤەر ڕێگەپێدراوە | وێنە قەدەغەیە")
+    return e
+
+
+class RkPartnerView(SecBaseView):
+    def __init__(self, guild, author_id):
+        super().__init__(guild, author_id)
+        rk = get_rk(guild.id)
+        self.add_item(PanelChannelSelect("rkp", row=0))
+        self.toggle.label = "Partner: ON" if rk["partner_enabled"] else "Partner: OFF"
+        self.toggle.style = discord.ButtonStyle.success if rk["partner_enabled"] else discord.ButtonStyle.danger
+
+    @discord.ui.button(label="Toggle", row=1)
+    async def toggle(self, interaction, button):
+        rk = get_rk(self.guild.id)
+        rk["partner_enabled"] = not rk["partner_enabled"]
+        save_config()
+        await panel_edit(interaction, self, "rkp")
+
+    @discord.ui.button(label="Clear Channels", style=discord.ButtonStyle.secondary, row=1)
+    async def clear_ch(self, interaction, button):
+        get_rk(self.guild.id)["partner_channels"] = []
+        save_config()
+        await panel_edit(interaction, self, "rkp")
+
+    @discord.ui.button(label="‹ Back", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction, button):
+        await panel_edit(interaction, self, "rk")
+
+
+# ---------------------------------------------------------
+# /blocklink
+# ---------------------------------------------------------
+
+def get_bl(gid):
+    b = cfg(gid).setdefault("blocklink", {})
+    b.setdefault("enabled", True)
+    b.setdefault("channels", [])
+    return b
+
+
+async def bl_check(message):
+    if message.author.bot or message.guild is None:
+        return
+    if is_partner_channel(message):
+        return
+    b = get_bl(message.guild.id)
+    if not b["enabled"] or not b["channels"]:
+        return
+    ch = message.channel
+    if ch.id not in b["channels"] and getattr(ch, "parent_id", None) not in b["channels"]:
+        return
+    if chat_exempt(message.author):
+        return
+    if LINK_ANY_RX.search(message.content or ""):
+        await _delete_and_warn(message, "ناتوانیت لینک لێرە دابنێیت.")
+
+
+async def bl_on_message(message):
+    await bl_check(message)
+
+
+async def bl_on_edit(before, after):
+    await bl_check(after)
+
+
+bot.add_listener(bl_on_message, "on_message")
+bot.add_listener(bl_on_edit, "on_message_edit")
+
+
+def bl_embed(guild):
+    b = get_bl(guild.id)
+    e = discord.Embed(
+        title="🚫 Block Link " + ("(ON)" if b["enabled"] else "(OFF)"),
+        description="\n".join(f"<#{c}>" for c in b["channels"])[:3000] or "❌ هیچ کەناڵێک دیاری نەکراوە",
+        color=discord.Color.green() if b["enabled"] else discord.Color.red()
+    )
+    e.set_footer(text="لەم کەناڵانە هەر لینکێک بنێردرێت نامەکە دەسڕدرێتەوە")
+    return e
+
+
+class BlView(SecBaseView):
+    def __init__(self, guild, author_id):
+        super().__init__(guild, author_id)
+        b = get_bl(guild.id)
+        self.add_item(PanelChannelSelect("bl", row=0))
+        self.toggle.label = "Block Link: ON" if b["enabled"] else "Block Link: OFF"
+        self.toggle.style = discord.ButtonStyle.success if b["enabled"] else discord.ButtonStyle.danger
+
+    @discord.ui.button(label="Toggle", row=1)
+    async def toggle(self, interaction, button):
+        b = get_bl(self.guild.id)
+        b["enabled"] = not b["enabled"]
+        save_config()
+        await panel_edit(interaction, self, "bl")
+
+    @discord.ui.button(label="Clear Channels", style=discord.ButtonStyle.secondary, row=1)
+    async def clear_ch(self, interaction, button):
+        get_bl(self.guild.id)["channels"] = []
+        save_config()
+        await panel_edit(interaction, self, "bl")
+
+
+@bot.tree.command(name="blocklink", description="کەناڵەکانی قەدەغەکردنی لینک")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def blocklink_cmd(interaction: discord.Interaction):
+    if not is_dev(interaction.user):
+        await deny_interaction(interaction)
+        return
+    await interaction.response.send_message(
+        embed=bl_embed(interaction.guild),
+        view=BlView(interaction.guild, interaction.user.id),
         ephemeral=True
     )
 
