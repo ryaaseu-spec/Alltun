@@ -818,9 +818,12 @@ async def on_voice_state_update(member, before, after):
         and after.channel is not None
         and before.channel.id != after.channel.id
     ):
+        mover = await find_voice_mover(guild, after.channel.id)
+        by_line = f"**Moved By:** {mover.mention}\n" if mover else ""
         embed = make_embed(
             "🔀 Voice Move",
             f"**Member:** {member.mention}\n"
+            f"{by_line}"
             f"**From:** `{before.channel.name}`\n"
             f"**To:** `{after.channel.name}`",
             discord.Color.gold()
@@ -1289,61 +1292,6 @@ async def setlogall(interaction: discord.Interaction, channel: discord.TextChann
     )
 
 
-@bot.tree.command(name="setstaff", description="دیاریکردنی ڕۆڵەکانی ستاف بۆ /staff")
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@app_commands.describe(slot="جۆری ستاف", role="ڕۆڵەکە")
-@app_commands.choices(
-    slot=[
-        app_commands.Choice(name="Lady Staff", value="staff1"),
-        app_commands.Choice(name="Boy Staff", value="staff2"),
-    ]
-)
-async def setstaff(interaction: discord.Interaction, slot: str, role: discord.Role):
-    if not is_dev(interaction.user):
-        await deny_interaction(interaction)
-        return
-
-    cfg(interaction.guild.id)["roles"][slot] = role.id
-    save_config()
-
-    await interaction.response.send_message(
-        f"✅ {STAFF_LABELS.get(slot, slot)} → **{role.name}**", ephemeral=True
-    )
-
-
-@bot.tree.command(name="regri-roles", description="ڕۆڵەکانی ئەو کەسانەی دەتوانن /regri بەکاربهێنن")
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@app_commands.describe(action="زیادکردن یان لابردن", role="ڕۆڵەکە")
-@app_commands.choices(
-    action=[
-        app_commands.Choice(name="Add", value="add"),
-        app_commands.Choice(name="Remove", value="remove"),
-    ]
-)
-async def regri_roles(interaction: discord.Interaction, action: str, role: discord.Role):
-    if not is_dev(interaction.user):
-        await deny_interaction(interaction)
-        return
-
-    c = cfg(interaction.guild.id)
-
-    if action == "add":
-        if role.id not in c["regri_roles"]:
-            c["regri_roles"].append(role.id)
-        msg = f"✅ {role.mention} زیادکرا."
-    else:
-        if role.id in c["regri_roles"]:
-            c["regri_roles"].remove(role.id)
-        msg = f"✅ {role.mention} لابرا."
-
-    save_config()
-    await interaction.response.send_message(
-        msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
-    )
-
-
 # ---------------------------------------------------------
 # /rolemute  /roleban  /rolesafika  /rolestaff
 # ---------------------------------------------------------
@@ -1378,42 +1326,6 @@ PERM_ACTION_CHOICES = [
     app_commands.Choice(name="Add (زیادکردن)", value="add"),
     app_commands.Choice(name="Remove (لابردن)", value="remove"),
 ]
-
-
-@bot.tree.command(name="rolemute", description="دیاریکردنی ئەو ڕۆڵانەی دەتوانن Mute بکەن")
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@app_commands.describe(action="زیادکردن یان لابردن", role="ڕۆڵەکە")
-@app_commands.choices(action=PERM_ACTION_CHOICES)
-async def rolemute(interaction: discord.Interaction, action: str, role: discord.Role):
-    await update_perm_role(interaction, "mute", action, role)
-
-
-@bot.tree.command(name="roleban", description="دیاریکردنی ئەو ڕۆڵانەی دەتوانن Bfra / Unban بکەن")
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@app_commands.describe(action="زیادکردن یان لابردن", role="ڕۆڵەکە")
-@app_commands.choices(action=PERM_ACTION_CHOICES)
-async def roleban(interaction: discord.Interaction, action: str, role: discord.Role):
-    await update_perm_role(interaction, "ban", action, role)
-
-
-@bot.tree.command(name="rolesafika", description="دیاریکردنی ئەو ڕۆڵانەی دەتوانن Safika (کلێر) بکەن")
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@app_commands.describe(action="زیادکردن یان لابردن", role="ڕۆڵەکە")
-@app_commands.choices(action=PERM_ACTION_CHOICES)
-async def rolesafika(interaction: discord.Interaction, action: str, role: discord.Role):
-    await update_perm_role(interaction, "safika", action, role)
-
-
-@bot.tree.command(name="rolestaff", description="دیاریکردنی ئەو ڕۆڵانەی دەتوانن /staff بەکاربهێنن")
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@app_commands.describe(action="زیادکردن یان لابردن", role="ڕۆڵەکە")
-@app_commands.choices(action=PERM_ACTION_CHOICES)
-async def rolestaff(interaction: discord.Interaction, action: str, role: discord.Role):
-    await update_perm_role(interaction, "staff", action, role)
 
 
 @bot.tree.command(name="setmuterole", description="دیاریکردنی ئەو ڕۆڵەی لە کاتی Mute دەدرێت بە کەسەکە")
@@ -1498,32 +1410,6 @@ async def autorole_cmd(interaction: discord.Interaction, action: str, role: disc
     )
 
 
-@bot.tree.command(name="setdev", description="دیاریکردنی ڕۆڵی دیڤیلۆپەر (تەنها خاوەنی سێرڤەر)")
-@app_commands.guild_only()
-@app_commands.describe(action="زیادکردن یان لابردن", role="ڕۆڵی دیڤیلۆپەر")
-@app_commands.choices(action=PERM_ACTION_CHOICES)
-async def setdev(interaction: discord.Interaction, action: str, role: discord.Role):
-    if interaction.user.id != interaction.guild.owner_id:
-        await deny_interaction(interaction)
-        return
-
-    c = cfg(interaction.guild.id)
-
-    if action == "add":
-        if role.id not in c["dev_roles"]:
-            c["dev_roles"].append(role.id)
-        msg = f"✅ {role.mention} بوو بە ڕۆڵی دیڤیلۆپەر."
-    else:
-        if role.id in c["dev_roles"]:
-            c["dev_roles"].remove(role.id)
-        msg = f"✅ {role.mention} لە ڕۆڵی دیڤیلۆپەر لابرا."
-
-    save_config()
-    await interaction.response.send_message(
-        msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
-    )
-
-
 @bot.tree.command(name="config", description="پیشاندانی ڕێکخستنەکانی ئەم سێرڤەرە")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
@@ -1540,8 +1426,8 @@ async def config_cmd(interaction: discord.Interaction):
         lines.append(f"**{name}:** {f'<#{cid}>' if cid else '❌'}")
 
     for slot in ("staff1", "staff2"):
-        rid = c["roles"].get(slot)
-        lines.append(f"**{STAFF_LABELS[slot]}:** {f'<@&{rid}>' if rid else '❌'}")
+        sr = ", ".join(f"<@&{r}>" for r in get_staff_roles(interaction.guild.id, slot)) or "❌"
+        lines.append(f"**{STAFF_LABELS[slot]}:** {sr}")
 
     regri_txt = ", ".join(f"<@&{r}>" for r in c["regri_roles"]) or "❌"
     lines.append(f"**Regri roles:** {regri_txt}")
@@ -1593,24 +1479,28 @@ async def staff(
         return
 
     try:
-        role_id = cfg(interaction.guild.id)["roles"].get(role_choice)
-        role = interaction.guild.get_role(role_id) if role_id else None
+        ids = get_staff_roles(interaction.guild.id, role_choice)
+        roles = [r for r in (interaction.guild.get_role(x) for x in ids) if r]
 
-        if not role:
+        if not roles:
             await interaction.response.send_message(
                 "❌ ڕۆڵەکە دیاری نەکراوە! سەرەتا /setstaff بەکاربهێنە.", ephemeral=True
             )
             return
 
-        if role in member.roles:
+        new_roles = [r for r in roles if r not in member.roles]
+        if not new_roles:
             await interaction.response.send_message(
-                f"⚠ {member.mention} پێشتر ئەم ڕۆڵەی هەیە (`{role.name}`).", ephemeral=True
+                f"⚠ {member.mention} پێشتر هەموو ئەم ڕۆڵانەی هەیە.", ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none()
             )
         else:
-            await member.add_roles(role, reason=f"Staff given by {interaction.user}")
+            await member.add_roles(*new_roles, reason=f"Staff given by {interaction.user}")
+            names = ", ".join(f"**{r.name}**" for r in new_roles)
             await interaction.response.send_message(
-                f"✅ ڕۆڵی **{role.name}** بە سەرکەوتوویی درا بە {member.mention}",
-                ephemeral=True
+                f"✅ ڕۆڵی {names} بە سەرکەوتوویی درا بە {member.mention}",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none()
             )
 
     except Exception as e:
@@ -1620,65 +1510,6 @@ async def staff(
 # =========================================================
 # 27. COLOR ROLE SYSTEM
 # =========================================================
-
-@bot.tree.command(
-    name="regadan-ranggorin",
-    description="ڕێگەپێدانی ڕۆڵ یان کەس بۆ گۆڕینی ڕەنگی ڕۆڵ"
-)
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@app_commands.describe(
-    action="زیادکردن یان لابردن",
-    role="ڕۆڵێک کە ڕێگەی پێبدرێت (ئارەزوومەندانە)",
-    member="کەسێکی تایبەت کە ڕێگەی پێبدرێت (ئارەزوومەندانە)"
-)
-@app_commands.choices(action=PERM_ACTION_CHOICES)
-async def regadan_ranggorin(
-    interaction: discord.Interaction,
-    action: str,
-    role: discord.Role = None,
-    member: discord.Member = None
-):
-    if not is_dev(interaction.user):
-        await deny_interaction(interaction)
-        return
-
-    if role is None and member is None:
-        await interaction.response.send_message(
-            "❌ دەبێت ڕۆڵێک یان کەسێک دیاری بکەیت.", ephemeral=True
-        )
-        return
-
-    c = cfg(interaction.guild.id)
-    lines = []
-
-    if role is not None:
-        if action == "add":
-            if role.id not in c["color_roles"]:
-                c["color_roles"].append(role.id)
-            lines.append(f"✅ {role.mention} ئێستا دەتوانێت ڕەنگی ڕۆڵ بگۆڕێت.")
-        else:
-            if role.id in c["color_roles"]:
-                c["color_roles"].remove(role.id)
-            lines.append(f"✅ {role.mention} لە ڕێگەپێدانی ڕەنگ لابرا.")
-
-    if member is not None:
-        if action == "add":
-            if member.id not in c["color_users"]:
-                c["color_users"].append(member.id)
-            lines.append(f"✅ {member.mention} ئێستا دەتوانێت ڕەنگی ڕۆڵ بگۆڕێت.")
-        else:
-            if member.id in c["color_users"]:
-                c["color_users"].remove(member.id)
-            lines.append(f"✅ {member.mention} لە ڕێگەپێدانی ڕەنگ لابرا.")
-
-    save_config()
-    await interaction.response.send_message(
-        "\n".join(lines),
-        ephemeral=True,
-        allowed_mentions=discord.AllowedMentions.none()
-    )
-
 
 def parse_hex_color(text):
     """'#FF0000' / 'ff0000' / '#f00' -> discord.Color, or None if invalid."""
@@ -1862,6 +1693,9 @@ def get_sec(gid):
         m = mods.setdefault(k, {"enabled": en, "limit": lim, "seconds": sec, "timeout": tmo})
         m.setdefault("timeout", tmo)
         m.setdefault("remove_roles", k in SEC_ROLE_REMOVE_DEFAULT)
+        m.setdefault("wl_users", [])
+        m.setdefault("wl_roles", [])
+        m.setdefault("wl_channels", [])
     return s
 
 
@@ -2002,7 +1836,7 @@ async def sec_punish(guild, uid, key, count):
 
 async def sec_register(guild, uid, key, what):
     """Count one action. Returns True if the user was punished."""
-    if uid is None or not sec_mod_on(guild, key) or sec_exempt(guild, uid):
+    if uid is None or not sec_mod_on(guild, key) or sec_exempt(guild, uid) or sec_mod_exempt(guild, uid, key):
         return False
     m = get_sec(guild.id)["modules"][key]
     sec_add_detail(guild.id, uid, what)
@@ -2044,8 +1878,11 @@ async def sec_on_message(message):
     mods = s["modules"]
     text = message.content or ""
 
+    def skip(key):
+        return sec_mod_exempt(guild, uid, key, message.channel)
+
     # ---- mention spam ----
-    if mods["mention"]["enabled"]:
+    if mods["mention"]["enabled"] and not skip("mention"):
         cnt = len(message.mentions) + len(message.role_mentions) + (1 if message.mention_everyone else 0)
         if cnt > mods["mention"]["limit"]:
             await sec_safe_delete(message)
@@ -2055,7 +1892,7 @@ async def sec_on_message(message):
 
     # ---- invite / link ----
     for key, rx in (("invite", SEC_INVITE_RX), ("link", SEC_LINK_RX)):
-        if mods[key]["enabled"] and rx.search(text) and not is_partner_channel(message):
+        if mods[key]["enabled"] and rx.search(text) and not is_partner_channel(message) and not skip(key):
             await sec_safe_delete(message)
             done = await sec_register(
                 guild, uid, key,
@@ -2071,7 +1908,7 @@ async def sec_on_message(message):
 
     # ---- message spam ----
     m = mods["spam"]
-    if m["enabled"]:
+    if m["enabled"] and not skip("spam"):
         now = time.time()
         dq = _sec_spam[(guild.id, uid)]
         dq.append((now, message))
@@ -2189,7 +2026,7 @@ async def sec_on_member_join(member):
     if not sec_mod_on(g, "bot_add"):
         return
     entry = await sec_audit(g, [discord.AuditLogAction.bot_add], member.id)
-    if not (entry and entry.user) or sec_exempt(g, entry.user.id):
+    if not (entry and entry.user) or sec_exempt(g, entry.user.id) or sec_mod_exempt(g, entry.user.id, "bot_add"):
         return
     try:
         await member.kick(reason="Security: Anti-Bot Add")
@@ -2256,6 +2093,10 @@ def sec_module_embed(guild, key):
     e.add_field(name="Seconds", value=f"`{m['seconds']}`")
     e.add_field(name="Timeout (خولەک)", value=f"`{m['timeout']}`")
     e.add_field(name="Remove Roles", value="🎭 بەڵێ" if m["remove_roles"] else "نەخێر")
+    wl = f"👤 {len(m['wl_users'])} | 🎭 {len(m['wl_roles'])}"
+    if key in SEC_MSG_MODULES:
+        wl += f" | 💬 {len(m['wl_channels'])}"
+    e.add_field(name="Whitelist", value=wl)
     return e
 
 
@@ -2415,6 +2256,12 @@ class SecModuleView(SecBaseView):
         await interaction.response.edit_message(
             embed=sec_module_embed(self.guild, self.key),
             view=SecModuleView(self.guild, self.author_id, self.key))
+
+    @discord.ui.button(label="Whitelist ›", style=discord.ButtonStyle.secondary, row=1)
+    async def mod_wl_btn(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=secmod_wl_embed(self.guild, self.key),
+            view=SecModWLView(self.guild, self.author_id, self.key))
 
     @discord.ui.button(label="Edit Limit / Seconds / Timeout", style=discord.ButtonStyle.primary)
     async def edit_btn(self, interaction, button):
@@ -2687,11 +2534,14 @@ async def ar_on_message(message):
         try:
             await message.add_reaction(discord.PartialEmoji.from_str(e))
         except discord.Forbidden:
+            print(f"autoreact: بۆتەکە مۆڵەتی Add Reactions / Read Message History ی نییە لە #{message.channel}", flush=True)
             return
         except discord.NotFound as ex:
             if ex.code == 10008:   # نامەکە سڕایەوە
                 return
-        except Exception:
+            print(f"autoreact: ئیمۆجی {e} نەدۆزرایەوە (بۆتەکە لەو سێرڤەرەدا نییە کە ئیمۆجییەکەی لێیە)", flush=True)
+        except Exception as ex:
+            print(f"autoreact error ({e}): {ex}", flush=True)
             continue
 
 
@@ -3303,6 +3153,569 @@ async def blocklink_cmd(interaction: discord.Interaction):
         view=BlView(interaction.guild, interaction.user.id),
         ephemeral=True
     )
+
+
+# =========================================================
+# 36. VOICE MOVE (کێ موڤی کرد)
+# =========================================================
+
+_vc_move_seen = {}   # audit entry id -> count
+
+
+async def find_voice_mover(guild, dest_id):
+    """ئەگەر کەسێک (یان بۆتێک) ئەندامێکی موڤ کرد بۆ dest_id، ئەو کەسە دەگەڕێنێتەوە."""
+    await asyncio.sleep(1.5)
+    try:
+        async for entry in guild.audit_logs(limit=10, action=discord.AuditLogAction.member_move):
+            count = int(getattr(entry.extra, "count", 1) or 1)
+            ch = getattr(entry.extra, "channel", None)
+            prev = _vc_move_seen.get(entry.id)
+            _vc_move_seen[entry.id] = count
+            if getattr(ch, "id", None) != dest_id:
+                continue
+            if prev is None:
+                age = (datetime.datetime.now(datetime.timezone.utc) - entry.created_at).total_seconds()
+                if age <= 15:
+                    return entry.user
+            elif count > prev:
+                return entry.user
+    except Exception:
+        pass
+    return None
+
+
+async def vc_prime_move_cache():
+    for g in bot.guilds:
+        try:
+            async for entry in g.audit_logs(limit=10, action=discord.AuditLogAction.member_move):
+                _vc_move_seen[entry.id] = int(getattr(entry.extra, "count", 1) or 1)
+        except Exception:
+            pass
+
+
+bot.add_listener(vc_prime_move_cache, "on_ready")
+
+
+# =========================================================
+# 37. /setstaff  (چەند ڕۆڵ بۆ Lady Staff و Boy Staff)
+# =========================================================
+
+def get_staff_cfg(gid):
+    c = cfg(gid)
+    if "staff_roles" not in c:
+        # گواستنەوەی ڕۆڵە کۆنەکە (یەک ڕۆڵ) بۆ لیست
+        c["staff_roles"] = {k: ([c["roles"][k]] if c["roles"].get(k) else []) for k in STAFF_LABELS}
+    for k in STAFF_LABELS:
+        c["staff_roles"].setdefault(k, [])
+    return c["staff_roles"]
+
+
+def get_staff_roles(gid, slot):
+    return get_staff_cfg(gid)[slot]
+
+
+def staff_embed(guild):
+    e = discord.Embed(title="👮 Staff Roles", color=discord.Color.blurple())
+    for slot, label in STAFF_LABELS.items():
+        roles = " ".join(f"<@&{r}>" for r in get_staff_roles(guild.id, slot)) or "❌"
+        e.add_field(name=label, value=roles[:1000], inline=False)
+    e.set_footer(text="ڕۆڵەکان هەڵبژێرە، لیستی پێشوو دەگۆڕێت | /staff هەموو ڕۆڵەکان دەدات")
+    return e
+
+
+class StaffRoleSelect(discord.ui.RoleSelect):
+    def __init__(self, slot, row):
+        super().__init__(
+            placeholder=f"{STAFF_LABELS[slot]} — ڕۆڵەکان هەڵبژێرە (چەند ڕۆڵ)...",
+            min_values=1, max_values=25, row=row
+        )
+        self.slot = slot
+
+    async def callback(self, interaction):
+        g = self.view.guild
+        get_staff_cfg(g.id)[self.slot] = [r.id for r in self.values]
+        save_config()
+        await interaction.response.edit_message(
+            embed=staff_embed(g), view=StaffView(g, self.view.author_id))
+
+
+class StaffView(SecBaseView):
+    def __init__(self, guild, author_id):
+        super().__init__(guild, author_id)
+        self.add_item(StaffRoleSelect("staff1", 0))
+        self.add_item(StaffRoleSelect("staff2", 1))
+
+    @discord.ui.button(label="Clear Lady Staff", style=discord.ButtonStyle.secondary, row=2)
+    async def clear1(self, interaction, button):
+        get_staff_cfg(self.guild.id)["staff1"] = []
+        save_config()
+        await interaction.response.edit_message(
+            embed=staff_embed(self.guild), view=StaffView(self.guild, self.author_id))
+
+    @discord.ui.button(label="Clear Boy Staff", style=discord.ButtonStyle.secondary, row=2)
+    async def clear2(self, interaction, button):
+        get_staff_cfg(self.guild.id)["staff2"] = []
+        save_config()
+        await interaction.response.edit_message(
+            embed=staff_embed(self.guild), view=StaffView(self.guild, self.author_id))
+
+
+@bot.tree.command(name="setstaff", description="دیاریکردنی ڕۆڵەکانی Lady Staff و Boy Staff بۆ /staff")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def setstaff(interaction: discord.Interaction):
+    if not is_dev(interaction.user):
+        await deny_interaction(interaction)
+        return
+    await interaction.response.send_message(
+        embed=staff_embed(interaction.guild),
+        view=StaffView(interaction.guild, interaction.user.id),
+        ephemeral=True
+    )
+
+
+# =========================================================
+# 38. PERMISSION ROLE PANELS (مەڵتی ڕۆڵ بە یەکجار)
+#     /rolemute /roleban /rolesafika /rolestaff /regri-roles
+#     /regadan-ranggorin /setdev
+# =========================================================
+
+PERM_PANEL_LABELS = {
+    "mute": "Mute",
+    "ban": "Ban (Bfra / Unban)",
+    "safika": "Safika (Clear)",
+    "staff": "Staff (/staff)",
+    "regri": "Regri (/regri)",
+    "color": "Color (/rangi-role)",
+    "dev": "Developer",
+}
+
+
+def perm_list(gid, key):
+    c = cfg(gid)
+    if key in PERM_LABELS:
+        return c["perm_roles"][key]
+    return {"regri": c["regri_roles"], "color": c["color_roles"], "dev": c["dev_roles"]}[key]
+
+
+def perm_embed(guild, key):
+    c = cfg(guild.id)
+    roles = " ".join(f"<@&{r}>" for r in perm_list(guild.id, key)) or "❌"
+    e = discord.Embed(
+        title=f"🔑 {PERM_PANEL_LABELS[key]} — ڕۆڵەکان",
+        description=roles[:3500],
+        color=discord.Color.blurple()
+    )
+    if key == "color":
+        users = " ".join(f"<@{u}>" for u in c["color_users"]) or "❌"
+        e.add_field(name="کەسەکان", value=users[:1000], inline=False)
+    e.set_footer(text="هەڵبژاردنی نوێ لیستی پێشوو دەگۆڕێت")
+    return e
+
+
+def perm_allowed(member, key):
+    if key == "dev":
+        return member.id == member.guild.owner_id
+    return is_dev(member)
+
+
+class PermRolesSelect(discord.ui.RoleSelect):
+    def __init__(self, key):
+        super().__init__(placeholder="ڕۆڵەکان هەڵبژێرە (چەند ڕۆڵ)...", min_values=1, max_values=25, row=0)
+        self.key = key
+
+    async def callback(self, interaction):
+        g = self.view.guild
+        perm_list(g.id, self.key)[:] = [r.id for r in self.values]
+        save_config()
+        await interaction.response.edit_message(
+            embed=perm_embed(g, self.key), view=PermRolesView(g, self.view.author_id, self.key))
+
+
+class PermUsersSelect(discord.ui.UserSelect):
+    def __init__(self):
+        super().__init__(placeholder="کەسەکان هەڵبژێرە...", min_values=1, max_values=25, row=1)
+
+    async def callback(self, interaction):
+        g = self.view.guild
+        cfg(g.id)["color_users"][:] = [u.id for u in self.values]
+        save_config()
+        await interaction.response.edit_message(
+            embed=perm_embed(g, "color"), view=PermRolesView(g, self.view.author_id, "color"))
+
+
+class PermRolesView(SecBaseView):
+    def __init__(self, guild, author_id, key):
+        super().__init__(guild, author_id)
+        self.key = key
+        self.add_item(PermRolesSelect(key))
+        if key == "color":
+            self.add_item(PermUsersSelect())
+        else:
+            self.remove_item(self.clear_users)
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.author_id or not perm_allowed(interaction.user, self.key):
+            await deny_interaction(interaction)
+            return False
+        return True
+
+    @discord.ui.button(label="Clear Roles", style=discord.ButtonStyle.secondary, row=2)
+    async def clear_roles(self, interaction, button):
+        perm_list(self.guild.id, self.key)[:] = []
+        save_config()
+        await interaction.response.edit_message(
+            embed=perm_embed(self.guild, self.key), view=PermRolesView(self.guild, self.author_id, self.key))
+
+    @discord.ui.button(label="Clear Users", style=discord.ButtonStyle.secondary, row=2)
+    async def clear_users(self, interaction, button):
+        cfg(self.guild.id)["color_users"][:] = []
+        save_config()
+        await interaction.response.edit_message(
+            embed=perm_embed(self.guild, self.key), view=PermRolesView(self.guild, self.author_id, self.key))
+
+
+async def open_perm_panel(interaction, key):
+    if not perm_allowed(interaction.user, key):
+        await deny_interaction(interaction)
+        return
+    await interaction.response.send_message(
+        embed=perm_embed(interaction.guild, key),
+        view=PermRolesView(interaction.guild, interaction.user.id, key),
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="rolemute", description="ئەو ڕۆڵانەی دەتوانن Mute بکەن")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def rolemute(interaction: discord.Interaction):
+    await open_perm_panel(interaction, "mute")
+
+
+@bot.tree.command(name="roleban", description="ئەو ڕۆڵانەی دەتوانن Bfra / Unban بکەن")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def roleban(interaction: discord.Interaction):
+    await open_perm_panel(interaction, "ban")
+
+
+@bot.tree.command(name="rolesafika", description="ئەو ڕۆڵانەی دەتوانن Safika (کلێر) بکەن")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def rolesafika(interaction: discord.Interaction):
+    await open_perm_panel(interaction, "safika")
+
+
+@bot.tree.command(name="rolestaff", description="ئەو ڕۆڵانەی دەتوانن /staff بەکاربهێنن")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def rolestaff(interaction: discord.Interaction):
+    await open_perm_panel(interaction, "staff")
+
+
+@bot.tree.command(name="regri-roles", description="ئەو ڕۆڵانەی دەتوانن /regri بەکاربهێنن")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def regri_roles(interaction: discord.Interaction):
+    await open_perm_panel(interaction, "regri")
+
+
+@bot.tree.command(name="regadan-ranggorin", description="ڕۆڵ و کەسانی ڕێگەپێدراو بۆ گۆڕینی ڕەنگی ڕۆڵ")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def regadan_ranggorin(interaction: discord.Interaction):
+    await open_perm_panel(interaction, "color")
+
+
+@bot.tree.command(name="setdev", description="ڕۆڵەکانی دیڤیلۆپەر (تەنها خاوەنی سێرڤەر)")
+@app_commands.guild_only()
+async def setdev(interaction: discord.Interaction):
+    await open_perm_panel(interaction, "dev")
+
+
+# =========================================================
+# 39. COUNTING  (/counting)
+# =========================================================
+
+def get_ct(gid):
+    b = cfg(gid).setdefault("counting", {})
+    b.setdefault("enabled", True)
+    b.setdefault("channel", None)
+    b.setdefault("last", 0)            # کۆتا ژمارەی ڕاست
+    b.setdefault("last_user", None)
+    b.setdefault("delete_text", False)  # نامەی نا-ژمارە بسڕدرێتەوە؟
+    b.setdefault("no_double", False)    # یەک کەس دوو جار لەسەر یەک نەنووسێت؟
+    return b
+
+
+def ct_embed(guild):
+    b = get_ct(guild.id)
+    e = discord.Embed(
+        title="🔢 Counting " + ("(ON)" if b["enabled"] else "(OFF)"),
+        color=discord.Color.green() if b["enabled"] else discord.Color.red()
+    )
+    e.add_field(name="کەناڵ", value=f"<#{b['channel']}>" if b["channel"] else "❌", inline=False)
+    e.add_field(name="کۆتا ژمارە", value=f"`{b['last']}`")
+    e.add_field(name="ژمارەی داهاتوو", value=f"`{b['last'] + 1}`")
+    e.add_field(name="نامەی نا-ژمارە دەسڕدرێتەوە", value="✅" if b["delete_text"] else "❌", inline=False)
+    e.add_field(name="دوو جار لەسەر یەک قەدەغەیە", value="✅" if b["no_double"] else "❌", inline=False)
+    return e
+
+
+async def ct_on_message(message):
+    if message.author.bot or message.guild is None:
+        return
+    b = get_ct(message.guild.id)
+    if not b["enabled"] or not b["channel"] or message.channel.id != b["channel"]:
+        return
+
+    text = (message.content or "").strip()
+    num = int(text) if (text.isdecimal() and len(text) <= 18) else None
+
+    if num is None:
+        if b["delete_text"]:
+            await _delete_and_warn(message, "لێرە تەنها ژمارە ڕێگەپێدراوە.")
+        return
+
+    double = b["no_double"] and b["last_user"] == message.author.id
+    if num == b["last"] + 1 and not double:
+        # یەکسەر state نوێ دەکرێتەوە، بۆ ئەوەی دوو کەس بە یەک ژمارە نەنووسن
+        b["last"] = num
+        b["last_user"] = message.author.id
+        save_config()
+        return
+
+    if double:
+        await _delete_and_warn(message, "ناتوانیت دوو جار لەسەر یەک ژمارە بنووسیت.")
+    else:
+        await _delete_and_warn(
+            message, "ناتوانیت ژمارەی کەم یان زیاد لە ئاستی ژمارەکەی ئێستا دابنێیت.")
+
+
+bot.add_listener(ct_on_message, "on_message")
+
+
+class CountChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="کەناڵی Counting هەڵبژێرە...",
+            channel_types=[discord.ChannelType.text, discord.ChannelType.news],
+            min_values=1, max_values=1, row=0
+        )
+
+    async def callback(self, interaction):
+        g = self.view.guild
+        get_ct(g.id)["channel"] = self.values[0].id
+        save_config()
+        await interaction.response.edit_message(
+            embed=ct_embed(g), view=CountView(g, self.view.author_id))
+
+
+class CountNumberModal(discord.ui.Modal):
+    def __init__(self, guild, author_id):
+        super().__init__(title="Set Last Number")
+        self.guild, self.author_id = guild, author_id
+        self.num = discord.ui.TextInput(
+            label="کۆتا ژمارەی نێردراو", default=str(get_ct(guild.id)["last"]), max_length=18)
+        self.add_item(self.num)
+
+    async def on_submit(self, interaction):
+        v = self.num.value.strip()
+        if not v.isdecimal():
+            await interaction.response.send_message("❌ تەنها ژمارە بنووسە.", ephemeral=True)
+            return
+        b = get_ct(self.guild.id)
+        b["last"] = int(v)
+        b["last_user"] = None
+        save_config()
+        await interaction.response.edit_message(
+            embed=ct_embed(self.guild), view=CountView(self.guild, self.author_id))
+
+
+class CountView(SecBaseView):
+    def __init__(self, guild, author_id):
+        super().__init__(guild, author_id)
+        b = get_ct(guild.id)
+        self.add_item(CountChannelSelect())
+        self.toggle.label = "Counting: ON" if b["enabled"] else "Counting: OFF"
+        self.toggle.style = discord.ButtonStyle.success if b["enabled"] else discord.ButtonStyle.danger
+        self.text_btn.label = "Delete Text: " + ("ON" if b["delete_text"] else "OFF")
+        self.double_btn.label = "No Double: " + ("ON" if b["no_double"] else "OFF")
+
+    async def _refresh(self, interaction):
+        await interaction.response.edit_message(
+            embed=ct_embed(self.guild), view=CountView(self.guild, self.author_id))
+
+    @discord.ui.button(label="Toggle", row=1)
+    async def toggle(self, interaction, button):
+        b = get_ct(self.guild.id)
+        b["enabled"] = not b["enabled"]
+        save_config()
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="Set Last Number", style=discord.ButtonStyle.primary, row=1)
+    async def number_btn(self, interaction, button):
+        await interaction.response.send_modal(CountNumberModal(self.guild, self.author_id))
+
+    @discord.ui.button(label="Delete Text", style=discord.ButtonStyle.secondary, row=2)
+    async def text_btn(self, interaction, button):
+        b = get_ct(self.guild.id)
+        b["delete_text"] = not b["delete_text"]
+        save_config()
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="No Double", style=discord.ButtonStyle.secondary, row=2)
+    async def double_btn(self, interaction, button):
+        b = get_ct(self.guild.id)
+        b["no_double"] = not b["no_double"]
+        save_config()
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="Clear Channel", style=discord.ButtonStyle.secondary, row=2)
+    async def clear_ch(self, interaction, button):
+        get_ct(self.guild.id)["channel"] = None
+        save_config()
+        await self._refresh(interaction)
+
+
+@bot.tree.command(name="counting", description="کەناڵی ژماردن (Counting)")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def counting_cmd(interaction: discord.Interaction):
+    if not is_dev(interaction.user):
+        await deny_interaction(interaction)
+        return
+    await interaction.response.send_message(
+        embed=ct_embed(interaction.guild),
+        view=CountView(interaction.guild, interaction.user.id),
+        ephemeral=True
+    )
+
+
+# =========================================================
+# 40. SECURITY: وایت لیستی تایبەت بە هەر بەشێک
+# =========================================================
+
+SEC_MSG_MODULES = {"spam", "mention", "invite", "link"}
+
+
+def sec_mod_exempt(guild, uid, key, channel=None):
+    """وایت لیستی ئەم بەشە: کەس / ڕۆڵ / کەناڵ (یان کاتێگۆری ناو کەناڵ)"""
+    try:
+        m = get_sec(guild.id)["modules"][key]
+        if uid in m["wl_users"]:
+            return True
+        if channel is not None and m["wl_channels"]:
+            ids = {getattr(channel, "id", None),
+                   getattr(channel, "parent_id", None),
+                   getattr(channel, "category_id", None)}
+            if any(i in m["wl_channels"] for i in ids if i is not None):
+                return True
+        mem = guild.get_member(uid)
+        if mem and any(r.id in m["wl_roles"] for r in mem.roles):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def secmod_wl_embed(guild, key):
+    m = get_sec(guild.id)["modules"][key]
+    us = " ".join(f"<@{u}>" for u in m["wl_users"]) or "—"
+    rs = " ".join(f"<@&{r}>" for r in m["wl_roles"]) or "—"
+    desc = f"**Users:** {us}\n**Roles:** {rs}"
+    if key in SEC_MSG_MODULES:
+        chs = " ".join(f"<#{c}>" for c in m["wl_channels"]) or "—"
+        desc += f"\n**Channels / Categories:** {chs}"
+    desc += (
+        "\n\nئەوەی هەڵیدەبژێریت: ئەگەر لە لیستدا بێت لادەچێت، ئەگەر نەبێت زیاد دەبێت.\n"
+        "ئەم وایت لیستە تەنها بۆ ئەم بەشەیە. Owner، Developer و Whitelist ی گشتی هەمیشە ڕزگارن."
+    )
+    return discord.Embed(
+        title=f"✅ Whitelist — {SEC_MODULES[key][0]}",
+        description=desc[:4000],
+        color=discord.Color.blurple()
+    )
+
+
+def _toggle_ids(lst, items):
+    for i in items:
+        if i in lst:
+            lst.remove(i)
+        else:
+            lst.append(i)
+
+
+class SecModWLUsers(discord.ui.UserSelect):
+    def __init__(self, key):
+        super().__init__(placeholder="Users", min_values=1, max_values=10, row=0)
+        self.key = key
+
+    async def callback(self, interaction):
+        g = self.view.guild
+        _toggle_ids(get_sec(g.id)["modules"][self.key]["wl_users"], [u.id for u in self.values])
+        save_config()
+        await interaction.response.edit_message(
+            embed=secmod_wl_embed(g, self.key), view=SecModWLView(g, self.view.author_id, self.key))
+
+
+class SecModWLRoles(discord.ui.RoleSelect):
+    def __init__(self, key):
+        super().__init__(placeholder="Roles", min_values=1, max_values=10, row=1)
+        self.key = key
+
+    async def callback(self, interaction):
+        g = self.view.guild
+        _toggle_ids(get_sec(g.id)["modules"][self.key]["wl_roles"], [r.id for r in self.values])
+        save_config()
+        await interaction.response.edit_message(
+            embed=secmod_wl_embed(g, self.key), view=SecModWLView(g, self.view.author_id, self.key))
+
+
+class SecModWLChannels(discord.ui.ChannelSelect):
+    def __init__(self, key):
+        super().__init__(
+            placeholder="Channels / Categories (سپام لەوێ ئاساییە)",
+            channel_types=[
+                discord.ChannelType.text, discord.ChannelType.news, discord.ChannelType.voice,
+                discord.ChannelType.stage_voice, discord.ChannelType.forum, discord.ChannelType.category,
+            ],
+            min_values=1, max_values=25, row=2
+        )
+        self.key = key
+
+    async def callback(self, interaction):
+        g = self.view.guild
+        _toggle_ids(get_sec(g.id)["modules"][self.key]["wl_channels"], [c.id for c in self.values])
+        save_config()
+        await interaction.response.edit_message(
+            embed=secmod_wl_embed(g, self.key), view=SecModWLView(g, self.view.author_id, self.key))
+
+
+class SecModWLView(SecBaseView):
+    def __init__(self, guild, author_id, key):
+        super().__init__(guild, author_id)
+        self.key = key
+        self.add_item(SecModWLUsers(key))
+        self.add_item(SecModWLRoles(key))
+        if key in SEC_MSG_MODULES:
+            self.add_item(SecModWLChannels(key))
+
+    @discord.ui.button(label="Clear All", style=discord.ButtonStyle.danger, row=3)
+    async def clear_all(self, interaction, button):
+        m = get_sec(self.guild.id)["modules"][self.key]
+        m["wl_users"], m["wl_roles"], m["wl_channels"] = [], [], []
+        save_config()
+        await interaction.response.edit_message(
+            embed=secmod_wl_embed(self.guild, self.key),
+            view=SecModWLView(self.guild, self.author_id, self.key))
+
+    @discord.ui.button(label="‹ Back", style=discord.ButtonStyle.secondary, row=3)
+    async def back(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=sec_module_embed(self.guild, self.key),
+            view=SecModuleView(self.guild, self.author_id, self.key))
 
 
 # =========================================================
