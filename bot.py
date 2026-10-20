@@ -1084,7 +1084,7 @@ async def on_message(message):
                 )
             # نامەی تۆ و نامەی بۆتەکە هەردووکیان دەمێننەوە (هیچ دیلیتێک نییە)
             await message.channel.send(
-                f"xwa xerm bnwse dllm basha aqllba amjara {target.mention}"
+                f"unmute kraa  {target.mention}"
             )
         except discord.Forbidden:
             await message.channel.send(
