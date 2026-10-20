@@ -393,20 +393,12 @@ async def on_member_join(member):
             except Exception as e:
                 print(f"autorole error: {e}")
 
-    channel_id = c["channels"].get("welcome")
-    channel = member.guild.get_channel(channel_id) if channel_id else None
-
-    if channel:
+    for cid in list(get_welcome_channels(member.guild.id)):
+        channel = member.guild.get_channel(cid)
+        if channel is None:
+            continue
         try:
-            text = c["welcome_text"].replace("{server}", member.guild.name)
-            embed = discord.Embed(
-                title="WELCOME",
-                description=f"{member.mention}\n{text}"
-            )
-            embed.set_thumbnail(url=member.display_avatar.url)
-            if c.get("welcome_image"):
-                embed.set_image(url=c["welcome_image"])
-            await channel.send(embed=embed)
+            await channel.send(embed=build_welcome_embed(member))
         except Exception:
             pass
 
@@ -1203,51 +1195,6 @@ async def on_message(message):
 # 25. SETUP SLASH COMMANDS (per server)
 # =========================================================
 
-@bot.tree.command(name="welcome", description="دیاریکردنی کەناڵی بەخێرهاتن")
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@app_commands.describe(
-    channel="کەناڵی بەخێرهاتن",
-    text="دەقی بەخێرهاتن (دەتوانیت {server} بەکاربهێنیت)",
-    image="لینکی ڕەسم یان گیف (بۆ لابردن بنووسە: off)"
-)
-async def welcome_cmd(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel,
-    text: str = None,
-    image: str = None
-):
-    if not is_dev(interaction.user):
-        await deny_interaction(interaction)
-        return
-
-    c = cfg(interaction.guild.id)
-    c["channels"]["welcome"] = channel.id
-    image_note = ""
-    if image:
-        img = image.strip()
-        if img.lower() in ("off", "remove", "delete", "no", "none"):
-            c["welcome_image"] = None
-            image_note = "\n🖼 ڕەسم/گیف لابرا."
-        elif img.lower().startswith(("http://", "https://")):
-            c["welcome_image"] = img
-            image_note = "\n🖼 ڕەسم/گیف دیاری کرا."
-        else:
-            await interaction.response.send_message(
-                "❌ لینکی ڕەسم/گیف دەبێت بە `https://` دەست پێبکات.", ephemeral=True
-            )
-            return
-
-    c["channels"]["welcome"] = channel.id
-    if text:
-        c["welcome_text"] = text
-    save_config()
-
-    await interaction.response.send_message(
-        f"✅ کەناڵی بەخێرهاتن: {channel.mention}{image_note}", ephemeral=True
-    )
-
-
 @bot.tree.command(name="setlog", description="دیاریکردنی کەناڵی لۆگەکان")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
@@ -1422,6 +1369,10 @@ async def config_cmd(interaction: discord.Interaction):
     lines = []
 
     for k, name in LOG_TYPES.items():
+        if k == "welcome":
+            wl = " ".join(f"<#{x}>" for x in get_welcome_channels(interaction.guild.id)) or "❌"
+            lines.append(f"**{name}:** {wl}")
+            continue
         cid = c["channels"].get(k)
         lines.append(f"**{name}:** {f'<#{cid}>' if cid else '❌'}")
 
@@ -3716,6 +3667,128 @@ class SecModWLView(SecBaseView):
         await interaction.response.edit_message(
             embed=sec_module_embed(self.guild, self.key),
             view=SecModuleView(self.guild, self.author_id, self.key))
+
+
+# =========================================================
+# 41. /welcome  (چەند کەناڵ بۆ بەخێرهاتن)
+# =========================================================
+
+def get_welcome_channels(gid):
+    c = cfg(gid)
+    if "welcome_channels" not in c:
+        old = c["channels"].get("welcome")
+        c["welcome_channels"] = [old] if old else []
+    return c["welcome_channels"]
+
+
+def build_welcome_embed(member):
+    c = cfg(member.guild.id)
+    text = c["welcome_text"].replace("{server}", member.guild.name)
+    embed = discord.Embed(title="WELCOME", description=f"{member.mention}\n{text}")
+    embed.set_thumbnail(url=member.display_avatar.url)
+    if c.get("welcome_image"):
+        embed.set_image(url=c["welcome_image"])
+    return embed
+
+
+def welcome_panel_embed(guild):
+    c = cfg(guild.id)
+    chans = "\n".join(f"<#{x}>" for x in get_welcome_channels(guild.id)) or "❌"
+    e = discord.Embed(title="👋 Welcome", color=discord.Color.blurple())
+    e.add_field(name="کەناڵەکان", value=chans[:1000], inline=False)
+    e.add_field(name="دەق", value=(c["welcome_text"] or "—")[:1000], inline=False)
+    e.add_field(name="Image / GIF", value=c.get("welcome_image") or "❌", inline=False)
+    e.set_footer(text="چەند کەناڵ هەڵبژێریت، لیستی پێشوو دەگۆڕێت | {server} = ناوی سێرڤەر")
+    return e
+
+
+def welcome_sync(gid):
+    """کەناڵی یەکەم لە channels["welcome"] هەڵدەگیرێت بۆ ئەوەی ڕێکخستنە کۆنەکان نەشکێن"""
+    lst = get_welcome_channels(gid)
+    cfg(gid)["channels"]["welcome"] = lst[0] if lst else None
+
+
+class WelcomeChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="کەناڵەکانی بەخێرهاتن هەڵبژێرە (چەند کەناڵ)...",
+            channel_types=[discord.ChannelType.text, discord.ChannelType.news],
+            min_values=1, max_values=25, row=0
+        )
+
+    async def callback(self, interaction):
+        g = self.view.guild
+        get_welcome_channels(g.id)[:] = [c.id for c in self.values]
+        welcome_sync(g.id)
+        save_config()
+        await interaction.response.edit_message(
+            embed=welcome_panel_embed(g), view=WelcomeView(g, self.view.author_id))
+
+
+class WelcomeModal(discord.ui.Modal):
+    def __init__(self, guild, author_id):
+        super().__init__(title="Welcome Message")
+        self.guild, self.author_id = guild, author_id
+        c = cfg(guild.id)
+        self.text_in = discord.ui.TextInput(
+            label="دەق ({server} = ناوی سێرڤەر)", style=discord.TextStyle.paragraph,
+            default=c["welcome_text"] or None, required=False, max_length=1500)
+        self.image_in = discord.ui.TextInput(
+            label="Image / GIF link (بەتاڵ = لابردن)", default=c.get("welcome_image") or None,
+            required=False, max_length=500)
+        self.add_item(self.text_in)
+        self.add_item(self.image_in)
+
+    async def on_submit(self, interaction):
+        img = self.image_in.value.strip()
+        if img and not img.lower().startswith(("http://", "https://")):
+            await interaction.response.send_message(
+                "❌ لینکی ڕەسم/گیف دەبێت بە `https://` دەست پێبکات.", ephemeral=True)
+            return
+        c = cfg(self.guild.id)
+        if self.text_in.value.strip():
+            c["welcome_text"] = self.text_in.value
+        c["welcome_image"] = img or None
+        save_config()
+        await interaction.response.edit_message(
+            embed=welcome_panel_embed(self.guild), view=WelcomeView(self.guild, self.author_id))
+
+
+class WelcomeView(SecBaseView):
+    def __init__(self, guild, author_id):
+        super().__init__(guild, author_id)
+        self.add_item(WelcomeChannelSelect())
+
+    @discord.ui.button(label="Edit Message", style=discord.ButtonStyle.primary, row=1)
+    async def edit_btn(self, interaction, button):
+        await interaction.response.send_modal(WelcomeModal(self.guild, self.author_id))
+
+    @discord.ui.button(label="Preview", style=discord.ButtonStyle.success, row=1)
+    async def preview_btn(self, interaction, button):
+        await interaction.response.send_message(
+            embed=build_welcome_embed(interaction.user), ephemeral=True)
+
+    @discord.ui.button(label="Clear Channels", style=discord.ButtonStyle.secondary, row=1)
+    async def clear_btn(self, interaction, button):
+        get_welcome_channels(self.guild.id)[:] = []
+        welcome_sync(self.guild.id)
+        save_config()
+        await interaction.response.edit_message(
+            embed=welcome_panel_embed(self.guild), view=WelcomeView(self.guild, self.author_id))
+
+
+@bot.tree.command(name="welcome", description="کەناڵەکانی بەخێرهاتن (چەند کەناڵ)")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def welcome_cmd(interaction: discord.Interaction):
+    if not is_dev(interaction.user):
+        await deny_interaction(interaction)
+        return
+    await interaction.response.send_message(
+        embed=welcome_panel_embed(interaction.guild),
+        view=WelcomeView(interaction.guild, interaction.user.id),
+        ephemeral=True
+    )
 
 
 # =========================================================
