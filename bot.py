@@ -798,11 +798,21 @@ async def on_voice_state_update(member, before, after):
             discord.Color.green()
         )
     elif before.channel is not None and after.channel is None:
-        embed = make_embed(
-            "🔇 Voice Leave",
-            f"**Member:** {member.mention}\n**Channel:** `{before.channel.name}`",
-            discord.Color.red()
-        )
+        kicked_by = await find_voice_disconnector(guild)
+        if kicked_by:
+            embed = make_embed(
+                "⛔ Voice Disconnected",
+                f"**Member:** {member.mention}\n"
+                f"**Disconnected By:** {kicked_by.mention}\n"
+                f"**Channel:** `{before.channel.name}`",
+                discord.Color.orange()
+            )
+        else:
+            embed = make_embed(
+                "🔇 Voice Leave",
+                f"**Member:** {member.mention}\n**Channel:** `{before.channel.name}`",
+                discord.Color.red()
+            )
     elif (
         before.channel is not None
         and after.channel is not None
@@ -2475,6 +2485,515 @@ async def security_cmd(interaction: discord.Interaction):
         ephemeral=True
     )
 
+
+# =========================================================
+# 31. VOICE DISCONNECT HELPER (بۆ لۆگی ڤۆیس)
+# =========================================================
+# ئەم بەشە لە "# 30. RUN" ەوە بێنە سەرەوە (پێش RUN)
+
+_vc_disc_seen = {}   # audit entry id -> count
+
+
+async def find_voice_disconnector(guild):
+    """ئەگەر کەسێک بە ڕاکێشان/Disconnect ئەندامێکی لە ڤۆیس دەرکرد، ئەو کەسە دەگەڕێنێتەوە."""
+    await asyncio.sleep(1.5)
+    try:
+        async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.member_disconnect):
+            count = int(getattr(entry.extra, "count", 1) or 1)
+            prev = _vc_disc_seen.get(entry.id)
+            _vc_disc_seen[entry.id] = count
+            if prev is None:
+                age = (datetime.datetime.now(datetime.timezone.utc) - entry.created_at).total_seconds()
+                if age <= 15:
+                    return entry.user
+            elif count > prev:
+                return entry.user
+    except Exception:
+        pass
+    return None
+
+
+async def vc_prime_cache():
+    for g in bot.guilds:
+        try:
+            async for entry in g.audit_logs(limit=10, action=discord.AuditLogAction.member_disconnect):
+                _vc_disc_seen[entry.id] = int(getattr(entry.extra, "count", 1) or 1)
+        except Exception:
+            pass
+
+
+bot.add_listener(vc_prime_cache, "on_ready")
+
+
+# =========================================================
+# 32. SHARED HELPERS FOR /autoreact AND /reklam
+# =========================================================
+
+EMOJI_RX = re.compile(r"<a?:\w+:\d+>")
+
+
+def parse_emojis(text):
+    """<a:white:123> / ئیمۆجی ڕاستەوخۆ / ئایدی ئیمۆجی (ئەگەر بۆتەکە لەو سێرڤەرە بێت) — بە space جیا بکەرەوە"""
+    out = []
+    for tok in text.split():
+        found = EMOJI_RX.findall(tok)
+        if found:
+            out.extend(found)
+        elif tok.isdigit():
+            e = bot.get_emoji(int(tok))
+            if e:
+                out.append(str(e))
+        elif not tok.isascii():
+            out.append(tok)
+    return [e for i, e in enumerate(out) if e not in out[:i]]
+
+
+async def panel_edit(interaction, ctx, kind):
+    """ctx = view یان modal (guild و author_id ی هەیە)"""
+    g, uid = ctx.guild, ctx.author_id
+    if kind == "ar":
+        await interaction.response.edit_message(embed=ar_embed(g), view=ArView(g, uid))
+    else:
+        await interaction.response.edit_message(embed=rk_embed(g), view=RkView(g, uid))
+
+
+class PanelChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, kind, row=0):
+        super().__init__(
+            placeholder="کەناڵەکان هەڵبژێرە (چەند کەناڵ)...",
+            channel_types=[discord.ChannelType.text, discord.ChannelType.news, discord.ChannelType.voice],
+            min_values=1, max_values=25, row=row
+        )
+        self.kind = kind
+
+    async def callback(self, interaction):
+        g = self.view.guild
+        store = get_ar(g.id) if self.kind == "ar" else get_rk(g.id)
+        store["channels"] = [c.id for c in self.values]
+        save_config()
+        await panel_edit(interaction, self.view, self.kind)
+
+
+class PanelRoleSelect(discord.ui.RoleSelect):
+    def __init__(self, kind, field, placeholder, row):
+        super().__init__(placeholder=placeholder, min_values=1, max_values=25, row=row)
+        self.kind, self.field = kind, field
+
+    async def callback(self, interaction):
+        g = self.view.guild
+        get_rk(g.id)[self.field] = [r.id for r in self.values]
+        save_config()
+        await panel_edit(interaction, self.view, self.kind)
+
+
+# =========================================================
+# 33. AUTOREACT  (/autoreact)
+# =========================================================
+
+AR_MODE_ORDER = ["both", "image", "text"]
+AR_MODE_LABELS = {"both": "Text + Image", "image": "Image / GIF only", "text": "Text only"}
+AR_MAX_EMOJIS = 20   # Discord: زۆرترین 20 ڕیاکت لەسەر هەر نامەیەک
+IMG_LINK_RX = re.compile(r"https?://\S+\.(?:png|jpe?g|gif|webp)(?:\?\S*)?|tenor\.com/|giphy\.com/", re.I)
+
+
+def get_ar(gid):
+    a = cfg(gid).setdefault("autoreact", {})
+    a.setdefault("enabled", True)
+    a.setdefault("channels", [])
+    a.setdefault("emojis", [])
+    a.setdefault("mode", "both")
+    return a
+
+
+def ar_embed(guild):
+    a = get_ar(guild.id)
+    chans = "\n".join(f"<#{c}>" for c in a["channels"]) or "❌"
+    ems = " ".join(a["emojis"]) or "❌"
+    e = discord.Embed(
+        title="😀 Auto React " + ("(ON)" if a["enabled"] else "(OFF)"),
+        color=discord.Color.green() if a["enabled"] else discord.Color.red()
+    )
+    e.add_field(name="کەناڵەکان", value=chans[:1000], inline=False)
+    e.add_field(name=f"ئیمۆجیەکان ({len(a['emojis'])}/{AR_MAX_EMOJIS})", value=ems[:1000], inline=False)
+    e.add_field(name="ڕیاکت لەسەر", value=AR_MODE_LABELS[a["mode"]], inline=False)
+    e.set_footer(text="کەناڵ هەڵبژێریت، لیستەکەی پێشوو دەگۆڕێت")
+    return e
+
+
+def msg_has_image(m):
+    for a in m.attachments:
+        ct = (a.content_type or "").lower()
+        if ct.startswith("image/") or a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+            return True
+    for e in m.embeds:
+        if e.type in ("image", "gifv") or e.image.url or e.thumbnail.url:
+            return True
+    return bool(IMG_LINK_RX.search(m.content or ""))
+
+
+async def ar_on_message(message):
+    if message.author.bot or message.guild is None:
+        return
+    a = get_ar(message.guild.id)
+    if not a["enabled"] or not a["emojis"] or not a["channels"]:
+        return
+    ch = message.channel
+    if ch.id not in a["channels"] and getattr(ch, "parent_id", None) not in a["channels"]:
+        return
+
+    has_img = msg_has_image(message)
+    has_text = bool((message.content or "").strip())
+    mode = a["mode"]
+    if mode == "image":
+        ok = has_img
+    elif mode == "text":
+        ok = has_text and not has_img
+    else:
+        ok = has_img or has_text
+    if not ok:
+        return
+
+    for e in list(a["emojis"]):
+        try:
+            await message.add_reaction(discord.PartialEmoji.from_str(e))
+        except discord.Forbidden:
+            return
+        except discord.NotFound as ex:
+            if ex.code == 10008:   # نامەکە سڕایەوە
+                return
+        except Exception:
+            continue
+
+
+bot.add_listener(ar_on_message, "on_message")
+
+
+class ArRemoveSelect(discord.ui.Select):
+    def __init__(self, emojis):
+        opts = []
+        for i, e in enumerate(emojis[:25]):
+            pe = discord.PartialEmoji.from_str(e)
+            opts.append(discord.SelectOption(label=f"{i + 1}. {pe.name}"[:100], value=e))
+        super().__init__(
+            placeholder="ئیمۆجی هەڵبژێرە بۆ لابردن...",
+            options=opts, min_values=1, max_values=len(opts), row=1
+        )
+
+    async def callback(self, interaction):
+        a = get_ar(self.view.guild.id)
+        a["emojis"] = [e for e in a["emojis"] if e not in self.values]
+        save_config()
+        await panel_edit(interaction, self.view, "ar")
+
+
+class ArEmojiModal(discord.ui.Modal):
+    def __init__(self, guild, author_id):
+        super().__init__(title="Add Emojis")
+        self.guild, self.author_id = guild, author_id
+        self.box = discord.ui.TextInput(
+            label="ئیمۆجیەکان (بە space جیا بکەرەوە)",
+            style=discord.TextStyle.paragraph,
+            placeholder="<a:white:1533233199457763338> 🔥 ❤️",
+            max_length=2000
+        )
+        self.add_item(self.box)
+
+    async def on_submit(self, interaction):
+        a = get_ar(self.guild.id)
+        for e in parse_emojis(self.box.value):
+            if e not in a["emojis"] and len(a["emojis"]) < AR_MAX_EMOJIS:
+                a["emojis"].append(e)
+        save_config()
+        await panel_edit(interaction, self, "ar")
+
+
+class ArView(SecBaseView):
+    def __init__(self, guild, author_id):
+        super().__init__(guild, author_id)
+        a = get_ar(guild.id)
+        self.add_item(PanelChannelSelect("ar", row=0))
+        if a["emojis"]:
+            self.add_item(ArRemoveSelect(a["emojis"]))
+        self.toggle.label = "Auto React: ON" if a["enabled"] else "Auto React: OFF"
+        self.toggle.style = discord.ButtonStyle.success if a["enabled"] else discord.ButtonStyle.danger
+        self.mode_btn.label = AR_MODE_LABELS[a["mode"]]
+
+    @discord.ui.button(label="Toggle", row=2)
+    async def toggle(self, interaction, button):
+        a = get_ar(self.guild.id)
+        a["enabled"] = not a["enabled"]
+        save_config()
+        await panel_edit(interaction, self, "ar")
+
+    @discord.ui.button(label="Mode", style=discord.ButtonStyle.primary, row=2)
+    async def mode_btn(self, interaction, button):
+        a = get_ar(self.guild.id)
+        i = AR_MODE_ORDER.index(a["mode"])
+        a["mode"] = AR_MODE_ORDER[(i + 1) % len(AR_MODE_ORDER)]
+        save_config()
+        await panel_edit(interaction, self, "ar")
+
+    @discord.ui.button(label="Add Emojis", style=discord.ButtonStyle.secondary, row=2)
+    async def add_btn(self, interaction, button):
+        await interaction.response.send_modal(ArEmojiModal(self.guild, self.author_id))
+
+    @discord.ui.button(label="Clear Emojis", style=discord.ButtonStyle.secondary, row=2)
+    async def clear_emojis(self, interaction, button):
+        get_ar(self.guild.id)["emojis"] = []
+        save_config()
+        await panel_edit(interaction, self, "ar")
+
+    @discord.ui.button(label="Clear Channels", style=discord.ButtonStyle.secondary, row=2)
+    async def clear_channels(self, interaction, button):
+        get_ar(self.guild.id)["channels"] = []
+        save_config()
+        await panel_edit(interaction, self, "ar")
+
+
+@bot.tree.command(name="autoreact", description="ڕیاکتی خۆکار لە چەند کەناڵێک")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def autoreact_cmd(interaction: discord.Interaction):
+    if not is_dev(interaction.user):
+        await deny_interaction(interaction)
+        return
+    await interaction.response.send_message(
+        embed=ar_embed(interaction.guild),
+        view=ArView(interaction.guild, interaction.user.id),
+        ephemeral=True
+    )
+
+
+# =========================================================
+# 34. REKLAM  (/reklam)
+# =========================================================
+
+RK_DEFAULT_TRIGGERS = ["reklam", "ریکلام", "ڕیکلام"]
+
+
+def get_rk(gid):
+    rk = cfg(gid).setdefault("reklam", {})
+    rk.setdefault("enabled", True)
+    rk.setdefault("channels", [])
+    rk.setdefault("tag_roles", [])
+    rk.setdefault("blocked_roles", [])
+    rk.setdefault("triggers", list(RK_DEFAULT_TRIGGERS))
+    rk.setdefault("title", "Reklam")
+    rk.setdefault("text", "{user}\n\n{roles}")
+    rk.setdefault("image", None)
+    rk.setdefault("thumb", "avatar")     # "avatar" = وێنەی ئەو کەسەی Reklam ی نووسی
+    rk.setdefault("footer", None)
+    rk.setdefault("reply", False)
+    return rk
+
+
+def rk_build_embed(guild, member):
+    rk = get_rk(guild.id)
+    roles_text = " ".join(f"<@&{r}>" for r in rk["tag_roles"] if guild.get_role(r))
+    text = (rk["text"] or "").replace("{user}", member.mention).replace("{server}", guild.name)
+    if "{roles}" in text:
+        text = text.replace("{roles}", roles_text)
+    elif roles_text:
+        text += "\n\n" + roles_text
+
+    embed = discord.Embed(
+        title=rk["title"] or None,
+        description=text[:4000] or None,
+        color=discord.Color.blurple()
+    )
+    if rk["image"]:
+        embed.set_image(url=rk["image"])
+    th = rk["thumb"]
+    if th == "avatar":
+        embed.set_thumbnail(url=member.display_avatar.url)
+    elif th:
+        embed.set_thumbnail(url=th)
+    if rk["footer"]:
+        embed.set_footer(text=rk["footer"])
+    return embed
+
+
+async def rk_on_message(message):
+    if message.author.bot or message.guild is None:
+        return
+    g = message.guild
+    rk = get_rk(g.id)
+    if not rk["enabled"] or not rk["channels"]:
+        return
+    ch = message.channel
+    if ch.id not in rk["channels"] and getattr(ch, "parent_id", None) not in rk["channels"]:
+        return
+    if (message.content or "").strip().lower() not in {t.lower() for t in rk["triggers"]}:
+        return
+    if any(r.id in rk["blocked_roles"] for r in message.author.roles):
+        return
+    mute_role = get_mute_role(g)
+    if mute_role and mute_role in message.author.roles:
+        return
+
+    try:
+        embed = rk_build_embed(g, message.author)
+        if rk["reply"]:
+            await message.reply(embed=embed, mention_author=False)
+        else:
+            await ch.send(embed=embed)
+    except Exception as e:
+        print(f"reklam error: {e}")
+
+
+bot.add_listener(rk_on_message, "on_message")
+
+
+def rk_embed(guild):
+    rk = get_rk(guild.id)
+    e = discord.Embed(
+        title="📢 Reklam " + ("(ON)" if rk["enabled"] else "(OFF)"),
+        color=discord.Color.green() if rk["enabled"] else discord.Color.red()
+    )
+    e.add_field(name="کەناڵەکان", value="\n".join(f"<#{c}>" for c in rk["channels"])[:1000] or "❌", inline=False)
+    e.add_field(name="ڕۆڵەکانی تاگ (ناو بۆکسەکە)",
+                value=" ".join(f"<@&{r}>" for r in rk["tag_roles"])[:1000] or "❌", inline=False)
+    e.add_field(name="ڕۆڵە بلۆککراوەکان",
+                value=" ".join(f"<@&{r}>" for r in rk["blocked_roles"])[:1000] or "❌", inline=False)
+    e.add_field(name="وشەکانی Reklam", value=" , ".join(f"`{t}`" for t in rk["triggers"]), inline=False)
+    e.add_field(name="Title", value=rk["title"] or "—")
+    e.add_field(name="Image / GIF", value="✅" if rk["image"] else "❌")
+    e.add_field(name="Small image", value="avatar" if rk["thumb"] == "avatar" else ("✅" if rk["thumb"] else "❌"))
+    e.set_footer(text="Edit Message ← دەق، ئیمۆجی، لینکی ڕەسم | {user} {roles} {server}")
+    return e
+
+
+class RkMessageModal(discord.ui.Modal):
+    def __init__(self, guild, author_id):
+        super().__init__(title="Reklam Message")
+        self.guild, self.author_id = guild, author_id
+        rk = get_rk(guild.id)
+        self.title_in = discord.ui.TextInput(
+            label="Title", default=rk["title"] or None, required=False, max_length=256)
+        self.text_in = discord.ui.TextInput(
+            label="Text ({user} {roles} {server})", style=discord.TextStyle.paragraph,
+            default=rk["text"] or None, required=False, max_length=4000,
+            placeholder="<a:white:123456> دەقەکەت لێرە بنووسە")
+        self.image_in = discord.ui.TextInput(
+            label="Image / GIF link", default=rk["image"] or None, required=False, max_length=500)
+        self.thumb_in = discord.ui.TextInput(
+            label="Small image (avatar = user avatar)", default=rk["thumb"] or None,
+            required=False, max_length=500)
+        self.footer_in = discord.ui.TextInput(
+            label="Footer", default=rk["footer"] or None, required=False, max_length=200)
+        for item in (self.title_in, self.text_in, self.image_in, self.thumb_in, self.footer_in):
+            self.add_item(item)
+
+    async def on_submit(self, interaction):
+        image = self.image_in.value.strip()
+        thumb = self.thumb_in.value.strip()
+        if image and not image.lower().startswith(("http://", "https://")):
+            await interaction.response.send_message("❌ لینکی ڕەسم دەبێت بە `https://` دەست پێبکات.", ephemeral=True)
+            return
+        if thumb and thumb.lower() != "avatar" and not thumb.lower().startswith(("http://", "https://")):
+            await interaction.response.send_message("❌ Small image: `avatar` یان لینکی `https://`.", ephemeral=True)
+            return
+        rk = get_rk(self.guild.id)
+        rk["title"] = self.title_in.value.strip() or None
+        rk["text"] = self.text_in.value
+        rk["image"] = image or None
+        rk["thumb"] = "avatar" if thumb.lower() == "avatar" else (thumb or None)
+        rk["footer"] = self.footer_in.value.strip() or None
+        save_config()
+        await panel_edit(interaction, self, "rk")
+
+
+class RkTriggerModal(discord.ui.Modal):
+    def __init__(self, guild, author_id):
+        super().__init__(title="Reklam Words")
+        self.guild, self.author_id = guild, author_id
+        self.box = discord.ui.TextInput(
+            label="وشەکان (بە کۆما جیا بکەرەوە)",
+            default=", ".join(get_rk(guild.id)["triggers"]), max_length=300)
+        self.add_item(self.box)
+
+    async def on_submit(self, interaction):
+        words = [w.strip().lower() for w in self.box.value.split(",") if w.strip()]
+        if not words:
+            await interaction.response.send_message("❌ لانیکەم یەک وشە بنووسە.", ephemeral=True)
+            return
+        get_rk(self.guild.id)["triggers"] = words
+        save_config()
+        await panel_edit(interaction, self, "rk")
+
+
+class RkView(SecBaseView):
+    def __init__(self, guild, author_id):
+        super().__init__(guild, author_id)
+        rk = get_rk(guild.id)
+        self.add_item(PanelChannelSelect("rk", row=0))
+        self.add_item(PanelRoleSelect("rk", "tag_roles", "ڕۆڵەکانی تاگ (ناو بۆکسەکە)...", row=1))
+        self.add_item(PanelRoleSelect("rk", "blocked_roles", "ڕۆڵە بلۆککراوەکان...", row=2))
+        self.toggle.label = "Reklam: ON" if rk["enabled"] else "Reklam: OFF"
+        self.toggle.style = discord.ButtonStyle.success if rk["enabled"] else discord.ButtonStyle.danger
+        self.reply_btn.label = "Reply: " + ("ON" if rk["reply"] else "OFF")
+
+    @discord.ui.button(label="Toggle", row=3)
+    async def toggle(self, interaction, button):
+        rk = get_rk(self.guild.id)
+        rk["enabled"] = not rk["enabled"]
+        save_config()
+        await panel_edit(interaction, self, "rk")
+
+    @discord.ui.button(label="Edit Message", style=discord.ButtonStyle.primary, row=3)
+    async def edit_btn(self, interaction, button):
+        await interaction.response.send_modal(RkMessageModal(self.guild, self.author_id))
+
+    @discord.ui.button(label="Words", style=discord.ButtonStyle.secondary, row=3)
+    async def words_btn(self, interaction, button):
+        await interaction.response.send_modal(RkTriggerModal(self.guild, self.author_id))
+
+    @discord.ui.button(label="Reply", style=discord.ButtonStyle.secondary, row=3)
+    async def reply_btn(self, interaction, button):
+        rk = get_rk(self.guild.id)
+        rk["reply"] = not rk["reply"]
+        save_config()
+        await panel_edit(interaction, self, "rk")
+
+    @discord.ui.button(label="Preview", style=discord.ButtonStyle.success, row=4)
+    async def preview_btn(self, interaction, button):
+        try:
+            await interaction.response.send_message(
+                embed=rk_build_embed(self.guild, interaction.user), ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+
+    @discord.ui.button(label="Clear Channels", style=discord.ButtonStyle.secondary, row=4)
+    async def clear_ch(self, interaction, button):
+        get_rk(self.guild.id)["channels"] = []
+        save_config()
+        await panel_edit(interaction, self, "rk")
+
+    @discord.ui.button(label="Clear Tags", style=discord.ButtonStyle.secondary, row=4)
+    async def clear_tags(self, interaction, button):
+        get_rk(self.guild.id)["tag_roles"] = []
+        save_config()
+        await panel_edit(interaction, self, "rk")
+
+    @discord.ui.button(label="Clear Blocked", style=discord.ButtonStyle.secondary, row=4)
+    async def clear_blocked(self, interaction, button):
+        get_rk(self.guild.id)["blocked_roles"] = []
+        save_config()
+        await panel_edit(interaction, self, "rk")
+
+
+@bot.tree.command(name="reklam", description="ڕێکخستنی نامەی Reklam")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def reklam_cmd(interaction: discord.Interaction):
+    if not is_dev(interaction.user):
+        await deny_interaction(interaction)
+        return
+    await interaction.response.send_message(
+        embed=rk_embed(interaction.guild),
+        view=RkView(interaction.guild, interaction.user.id),
+        ephemeral=True
+    )
 
 
 # =========================================================
