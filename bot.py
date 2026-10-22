@@ -93,11 +93,37 @@ def cfg(guild_id):
     d.setdefault("welcome_image", None)  # image / gif link shown under the welcome text
     d.setdefault("dev_roles", [])      # developer roles (full control like owner)
     d.setdefault("mute_role", None)    # role given on mute (set with /setmuterole)
-    d.setdefault("autorole", None)     # role given automatically to new members (/autorole)
+    d.setdefault("autorole", None)     # OLD single autorole (migrated into autoroles)
+    d.setdefault("autoroles", [])      # roles given automatically to new members (/autorole)
+    if d.get("autorole"):
+        if d["autorole"] not in d["autoroles"]:
+            d["autoroles"].append(d["autorole"])
+        d["autorole"] = None
     perm = d.setdefault("perm_roles", {})  # roles allowed: mute / ban / safika / staff
     for k in PERM_LABELS:
         perm.setdefault(k, [])
+    bl = d.setdefault("perm_blacklist", {})  # users blocked from each permission
+    for k in ("mute", "ban", "safika", "staff", "regri"):
+        bl.setdefault(k, [])
     return d
+
+
+def blacklist_list(gid, key):
+    """Blacklisted user ids for a permission. Color uses the same list as /regri (restricted)."""
+    c = cfg(gid)
+    if key == "color":
+        return c["restricted"]
+    return c["perm_blacklist"].setdefault(key, [])
+
+
+def is_blacklisted(member, key):
+    """Blacklist beats roles/administrator. Only the server owner is exempt."""
+    try:
+        if member.id == member.guild.owner_id:
+            return False
+        return member.id in blacklist_list(member.guild.id, key)
+    except Exception:
+        return False
 
 
 def has_cmd_access(member, key):
@@ -105,6 +131,8 @@ def has_cmd_access(member, key):
     try:
         if member.id == member.guild.owner_id:
             return True
+        if is_blacklisted(member, key):
+            return False
         if member.guild_permissions.administrator:
             return True
         allowed = cfg(member.guild.id)["perm_roles"].get(key, [])
@@ -127,6 +155,8 @@ def is_dev(member):
 def has_staff_access(member):
     """Owner + developer roles + roles chosen with /rolestaff"""
     try:
+        if is_blacklisted(member, "staff"):
+            return False
         if is_dev(member):
             return True
         allowed = cfg(member.guild.id)["perm_roles"].get("staff", [])
@@ -138,6 +168,8 @@ def has_staff_access(member):
 def has_color_access(member):
     """Owner + developer roles + roles/users chosen with /regadan-ranggorin"""
     try:
+        if is_blacklisted(member, "color"):
+            return False
         if is_dev(member):
             return True
         c = cfg(member.guild.id)
@@ -257,6 +289,22 @@ def cmd_role_edit_by(role_id):
     item = _recent_cmd_role_edits.get(role_id)
     if item and time.time() - item[0] < 30:
         return item[1]
+    return None
+
+
+# ---- Roles given by the bot's own commands (/staff, autorole) ----
+_recent_cmd_role_gives = {}   # member_id -> (time, giver mention, via text)
+
+
+def mark_cmd_role_give(member_id, by_mention, via):
+    _recent_cmd_role_gives[member_id] = (time.time(), by_mention, via)
+
+
+def cmd_role_give_by(member_id):
+    """Returns (giver mention, via text) once, if a bot command just gave roles to this member."""
+    item = _recent_cmd_role_gives.pop(member_id, None)
+    if item and time.time() - item[0] < 30:
+        return item[1], item[2]
     return None
 
 
@@ -384,14 +432,13 @@ async def on_member_join(member):
     c = cfg(member.guild.id)
 
     # ---- Autorole ----
-    autorole_id = c.get("autorole")
-    if autorole_id:
-        auto_role = member.guild.get_role(autorole_id)
-        if auto_role:
-            try:
-                await member.add_roles(auto_role, reason="Autorole")
-            except Exception as e:
-                print(f"autorole error: {e}")
+    auto_roles = [r for r in (member.guild.get_role(x) for x in c["autoroles"]) if r]
+    if auto_roles:
+        try:
+            mark_cmd_role_give(member.id, member.guild.me.mention, "Autorole")
+            await member.add_roles(*auto_roles, reason="Autorole")
+        except Exception as e:
+            print(f"autorole error: {e}")
 
     for cid in list(get_welcome_channels(member.guild.id)):
         channel = member.guild.get_channel(cid)
@@ -493,12 +540,18 @@ async def on_member_update(before, after):
 
     real_added = [r for r in added_roles if r.name != "@everyone" and not is_mute_role(r)]
     if real_added:
-        entry = await get_audit_executor(guild, discord.AuditLogAction.member_role_update, after.id)
+        cmd = cmd_role_give_by(after.id)
+        if cmd:
+            given_by, via_text = cmd
+        else:
+            entry = await get_audit_executor(guild, discord.AuditLogAction.member_role_update, after.id)
+            given_by, via_text = who(entry), ""
         roles_text = "\n".join(f"➕ {r.mention}" for r in real_added)
+        via_line = f"\n\n**Via:** {via_text}" if via_text else ""
         embed = make_embed(
             "➕ Role Added",
             f"**Member:** {after.mention}\n"
-            f"**Given By:** {who(entry)}\n\n{roles_text}",
+            f"**Given By:** {given_by}\n\n{roles_text}{via_line}",
             discord.Color.green()
         )
         add_user_thumbnail(embed, after)
@@ -1084,7 +1137,7 @@ async def on_message(message):
                 )
             # نامەی تۆ و نامەی بۆتەکە هەردووکیان دەمێننەوە (هیچ دیلیتێک نییە)
             await message.channel.send(
-                f"unmute kraa  {target.mention}"
+                f"xwa xerm bnwse dllm basha aqllba amjara {target.mention}"
             )
         except discord.Forbidden:
             await message.channel.send(
@@ -1307,54 +1360,11 @@ async def setmuterole(interaction: discord.Interaction, role: discord.Role):
     )
 
 
-@bot.tree.command(name="autorole", description="دیاریکردنی ڕۆڵێک کە خۆکارانە بدرێت بە ئەندامی نوێ")
+@bot.tree.command(name="autorole", description="ڕۆڵە خۆکارەکان بۆ ئەندامی نوێ (چەند ڕۆڵ)")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
-@app_commands.describe(action="دانان یان لابردن", role="ڕۆڵەکە (بۆ Set پێویستە)")
-@app_commands.choices(
-    action=[
-        app_commands.Choice(name="Set (دانان)", value="set"),
-        app_commands.Choice(name="Off (لابردن)", value="off"),
-    ]
-)
-async def autorole_cmd(interaction: discord.Interaction, action: str, role: discord.Role = None):
-    if not is_dev(interaction.user):
-        await deny_interaction(interaction)
-        return
-
-    c = cfg(interaction.guild.id)
-
-    if action == "off":
-        c["autorole"] = None
-        save_config()
-        await interaction.response.send_message("✅ Autorole لابرا.", ephemeral=True)
-        return
-
-    if role is None:
-        await interaction.response.send_message(
-            "❌ ڕۆڵەکە دیاری بکە: `/autorole set @role`", ephemeral=True
-        )
-        return
-
-    if role.is_default() or role.managed:
-        await interaction.response.send_message(
-            "❌ ئەم ڕۆڵە ناکرێت وەک Autorole بەکاربێت.", ephemeral=True
-        )
-        return
-
-    c["autorole"] = role.id
-    save_config()
-
-    warn = ""
-    me = interaction.guild.me
-    if role >= me.top_role:
-        warn = f"\n⚠ ڕۆڵی بۆتەکە (**{me.top_role.name}**) دەبێت لە سەروو ئەم ڕۆڵەوە بێت لە Roles، دەنا نایدات."
-
-    await interaction.response.send_message(
-        f"✅ Autorole: {role.mention} — ئەندامی نوێ خۆکارانە ئەم ڕۆڵە وەردەگرێت.{warn}",
-        ephemeral=True,
-        allowed_mentions=discord.AllowedMentions.none()
-    )
+async def autorole_cmd(interaction: discord.Interaction):
+    await open_perm_panel(interaction, "auto")
 
 
 @bot.tree.command(name="config", description="پیشاندانی ڕێکخستنەکانی ئەم سێرڤەرە")
@@ -1394,8 +1404,8 @@ async def config_cmd(interaction: discord.Interaction):
     mrid = c.get("mute_role")
     lines.append(f"**Mute role:** {f'<@&{mrid}>' if mrid else '❌ (Muted بە ناو)'}")
 
-    arid = c.get("autorole")
-    lines.append(f"**Autorole:** {f'<@&{arid}>' if arid else '❌'}")
+    ar_txt = ", ".join(f"<@&{r}>" for r in c["autoroles"]) or "❌"
+    lines.append(f"**Autoroles:** {ar_txt}")
 
     for k, label in PERM_LABELS.items():
         roles_txt = ", ".join(f"<@&{r}>" for r in c["perm_roles"][k]) or "❌"
@@ -1446,6 +1456,7 @@ async def staff(
                 allowed_mentions=discord.AllowedMentions.none()
             )
         else:
+            mark_cmd_role_give(member.id, interaction.user.mention, "Bot command (/staff)")
             await member.add_roles(*new_roles, reason=f"Staff given by {interaction.user}")
             names = ", ".join(f"**{r.name}**" for r in new_roles)
             await interaction.response.send_message(
@@ -1566,7 +1577,7 @@ async def regri(interaction: discord.Interaction, member: discord.Member, action
     is_owner = interaction.user.id == interaction.guild.owner_id
     has_allowed_role = any(r.id in c["regri_roles"] for r in interaction.user.roles)
 
-    if not is_owner and not has_allowed_role:
+    if not is_owner and (not has_allowed_role or is_blacklisted(interaction.user, "regri")):
         await deny_interaction(interaction)
         return
 
@@ -3239,14 +3250,21 @@ PERM_PANEL_LABELS = {
     "regri": "Regri (/regri)",
     "color": "Color (/rangi-role)",
     "dev": "Developer",
+    "auto": "Autorole",
 }
+
+
+BL_KEYS = ("mute", "ban", "safika", "staff", "regri", "color")
 
 
 def perm_list(gid, key):
     c = cfg(gid)
     if key in PERM_LABELS:
         return c["perm_roles"][key]
-    return {"regri": c["regri_roles"], "color": c["color_roles"], "dev": c["dev_roles"]}[key]
+    return {
+        "regri": c["regri_roles"], "color": c["color_roles"],
+        "dev": c["dev_roles"], "auto": c["autoroles"],
+    }[key]
 
 
 def perm_embed(guild, key):
@@ -3260,7 +3278,12 @@ def perm_embed(guild, key):
     if key == "color":
         users = " ".join(f"<@{u}>" for u in c["color_users"]) or "❌"
         e.add_field(name="کەسەکان", value=users[:1000], inline=False)
-    e.set_footer(text="هەڵبژاردنی نوێ لیستی پێشوو دەگۆڕێت")
+    if key in BL_KEYS:
+        bl = " ".join(f"<@{u}>" for u in blacklist_list(guild.id, key)) or "❌"
+        e.add_field(name="🚫 Blacklist", value=bl[:1000], inline=False)
+        e.set_footer(text="ڕۆڵەکان: هەڵبژاردنی نوێ لیستی پێشوو دەگۆڕێت | Blacklist: کەسێک هەڵبژێریت زیاد دەبێت، ئەگەر پێشتر هەبێت لادەچێت")
+    else:
+        e.set_footer(text="هەڵبژاردنی نوێ لیستی پێشوو دەگۆڕێت")
     return e
 
 
@@ -3295,6 +3318,21 @@ class PermUsersSelect(discord.ui.UserSelect):
             embed=perm_embed(g, "color"), view=PermRolesView(g, self.view.author_id, "color"))
 
 
+class PermBlacklistSelect(discord.ui.UserSelect):
+    def __init__(self, key):
+        super().__init__(
+            placeholder="🚫 Blacklist — کەس هەڵبژێرە (زیاد / لابردن)...",
+            min_values=1, max_values=25, row=2 if key == "color" else 1)
+        self.key = key
+
+    async def callback(self, interaction):
+        g = self.view.guild
+        _toggle_ids(blacklist_list(g.id, self.key), [u.id for u in self.values])
+        save_config()
+        await interaction.response.edit_message(
+            embed=perm_embed(g, self.key), view=PermRolesView(g, self.view.author_id, self.key))
+
+
 class PermRolesView(SecBaseView):
     def __init__(self, guild, author_id, key):
         super().__init__(guild, author_id)
@@ -3304,6 +3342,10 @@ class PermRolesView(SecBaseView):
             self.add_item(PermUsersSelect())
         else:
             self.remove_item(self.clear_users)
+        if key in BL_KEYS:
+            self.add_item(PermBlacklistSelect(key))
+        else:
+            self.remove_item(self.clear_bl)
 
     async def interaction_check(self, interaction):
         if interaction.user.id != self.author_id or not perm_allowed(interaction.user, self.key):
@@ -3311,19 +3353,27 @@ class PermRolesView(SecBaseView):
             return False
         return True
 
-    @discord.ui.button(label="Clear Roles", style=discord.ButtonStyle.secondary, row=2)
-    async def clear_roles(self, interaction, button):
-        perm_list(self.guild.id, self.key)[:] = []
-        save_config()
+    async def _refresh(self, interaction):
         await interaction.response.edit_message(
             embed=perm_embed(self.guild, self.key), view=PermRolesView(self.guild, self.author_id, self.key))
 
-    @discord.ui.button(label="Clear Users", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="Clear Roles", style=discord.ButtonStyle.secondary, row=3)
+    async def clear_roles(self, interaction, button):
+        perm_list(self.guild.id, self.key)[:] = []
+        save_config()
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="Clear Users", style=discord.ButtonStyle.secondary, row=3)
     async def clear_users(self, interaction, button):
         cfg(self.guild.id)["color_users"][:] = []
         save_config()
-        await interaction.response.edit_message(
-            embed=perm_embed(self.guild, self.key), view=PermRolesView(self.guild, self.author_id, self.key))
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="Clear Blacklist", style=discord.ButtonStyle.danger, row=3)
+    async def clear_bl(self, interaction, button):
+        blacklist_list(self.guild.id, self.key)[:] = []
+        save_config()
+        await self._refresh(interaction)
 
 
 async def open_perm_panel(interaction, key):
