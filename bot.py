@@ -25,7 +25,7 @@ bot = commands.Bot(command_prefix="", intents=intents, case_insensitive=True)
 # 2. PER-SERVER CONFIG (saved in guild_config.json)
 # =========================================================
 # بۆ ئەوەی ڕێکخستنەکان لە Railway دوای ئەپدەیت/ڕیدیپلۆی نەسڕێنەوە:
-#   1) لە Railway Volume دروست بکە و Mount Path بکە بە  /data
+#   1) لە Railway Volume دروست بکەو Mount Path بکە بە  /data
 #   2) ئەگەر /data هەبێت بۆتەکە خۆکار لەوێ هەڵیدەگرێت
 #   (یان Variable بەناوی CONFIG_PATH دابنێ)
 
