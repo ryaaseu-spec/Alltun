@@ -3862,7 +3862,9 @@ XP_TZ = _dt.timezone(_dt.timedelta(hours=3))   # کاتی عێراق
 XP_CHAT_MIN, XP_CHAT_MAX = 8, 14               # XP بۆ هەر نامەیەک
 XP_CHAT_COOLDOWN = 8                           # چرکە: لە ماوەی ئەمەدا نامەی دووەم XP نادات (دژی سپام)
 XP_VOICE_PER_MIN = 10                          # XP بۆ هەر خولەکێک لە ڤۆیس
-XP_VOICE_MIN_HUMANS = 1                        # کەمترین ژمارەی کەس لە ڤۆیس (2 = تەنیا نابێت XP وەربگرێت)
+XP_VOICE_DEAF_MULT = 0.5                       # ئەگەر deaf بوو چەند XP وەربگرێت (0.5 = نیوە | 1 = وەک ئاسایی | 0 = هیچ)
+XP_VOICE_SKIP_AFK = True                      # True = چەناڵی AFK ی سێرڤەر XP نادات | False = ئەویش XP بدات
+XP_VOICE_MIN_HUMANS = 1                       # کەمترین ژمارەی کەس لە ڤۆیس (2 = تەنیا نابێت XP وەربگرێت)
 XP_TOP = 30                                    # چەند کەس لە بۆردەکە
 XP_REFRESH = 1.0                               # هەر چەند چرکە بۆردەکە نوێ بکرێتەوە (1 = کەمترین ڕێگەپێدراو لەلایەن Discord)
 XP_SAVE_EVERY = 15                             # هەر چەند چرکە داتا لەسەر دیسک هەڵبگیرێت
@@ -3988,7 +3990,7 @@ async def xp_voice_loop():
         keys = xp_period_keys()
         per_sec = XP_VOICE_PER_MIN / 60.0
         for guild in bot.guilds:
-            afk = guild.afk_channel
+            afk = guild.afk_channel if XP_VOICE_SKIP_AFK else None
             for vc in list(guild.voice_channels) + list(guild.stage_channels):
                 if afk and vc.id == afk.id:
                     continue
@@ -3997,9 +3999,12 @@ async def xp_voice_loop():
                     continue
                 for m in humans:
                     vs = m.voice
-                    if vs is None or vs.self_deaf or vs.deaf:
+                    if vs is None:
                         continue
-                    xp_add(guild.id, m.id, "voice", per_sec, keys)
+                    amount = per_sec
+                    if vs.self_deaf or vs.deaf:
+                        amount *= XP_VOICE_DEAF_MULT
+                    xp_add(guild.id, m.id, "voice", amount, keys)
     except Exception as e:
         print(f"xp voice loop error: {e}", flush=True)
 
