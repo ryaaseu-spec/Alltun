@@ -3861,8 +3861,8 @@ from discord.ext import tasks as _tasks
 XP_TZ = _dt.timezone(_dt.timedelta(hours=3))   # کاتی عێراق
 XP_CHAT_MIN, XP_CHAT_MAX = 8, 14               # XP بۆ هەر نامەیەک
 XP_CHAT_COOLDOWN = 8                           # چرکە: لە ماوەی ئەمەدا نامەی دووەم XP نادات (دژی سپام)
-XP_VOICE_PER_MIN = 10                          # XP بۆ هەر خولەکێک لە ڤۆیس
-XP_VOICE_DEAF_MULT = 0.5                       # ئەگەر deaf بوو چەند XP وەربگرێت (0.5 = نیوە | 1 = وەک ئاسایی | 0 = هیچ)
+XP_VOICE_PER_SEC = 1                           # XP بۆ هەر چرکەیەک لە ڤۆیس
+XP_VOICE_DEAF_MULT = 0.7                       # ئەگەر deaf بوو چەند XP وەربگرێت (0.7 = 70% | 1 = وەک ئاسایی | 0 = هیچ)
 XP_VOICE_SKIP_AFK = True                      # True = چەناڵی AFK ی سێرڤەر XP نادات | False = ئەویش XP بدات
 XP_VOICE_MIN_HUMANS = 1                       # کەمترین ژمارەی کەس لە ڤۆیس (2 = تەنیا نابێت XP وەربگرێت)
 XP_TOP = 30                                    # چەند کەس لە بۆردەکە
@@ -3895,6 +3895,7 @@ xp_db.setdefault("boards", [])   # [{"g","c","m","k","p"}]
 _xp_dirty = False
 _xp_board_state = {}             # message_id -> {"sig", "busy", "fails"}
 _xp_chat_last = {}
+_xp_tasks = set()                # نیشاندەری task ـەکان تا garbage collect نەکرێن
 
 
 # ---------- داتا ----------
@@ -3988,7 +3989,7 @@ bot.add_listener(xp_on_message, "on_message")
 async def xp_voice_loop():
     try:
         keys = xp_period_keys()
-        per_sec = XP_VOICE_PER_MIN / 60.0
+        per_sec = XP_VOICE_PER_SEC
         for guild in bot.guilds:
             afk = guild.afk_channel if XP_VOICE_SKIP_AFK else None
             for vc in list(guild.voice_channels) + list(guild.stage_channels):
@@ -4084,9 +4085,15 @@ async def xp_delete_board_message(b):
 async def xp_edit_board(b, st, embed, sig):
     try:
         pm = bot.get_partial_messageable(b["c"]).get_partial_message(b["m"])
+        t0 = time.time()
         await pm.edit(embed=embed)
+        took = time.time() - t0
         st["sig"] = sig
         st["fails"] = 0
+        # لۆگی دواکەوتن: ئەگەر Discord هێواش بوو یان Rate Limit بوو لە Railway Logs دەردەکەوێت
+        if took > 1.0 and time.time() - st.get("last_warn", 0) > 10:
+            st["last_warn"] = time.time()
+            print(f"[XP] board edit took {took:.1f}s (Discord rate limit / slow API)", flush=True)
     except discord.NotFound:
         xp_remove_board(b)
     except Exception as e:
@@ -4117,7 +4124,9 @@ async def xp_board_loop():
         if sig == st["sig"]:
             continue          # گۆڕانکاری نییە، پێویست بە edit نییە
         st["busy"] = True
-        asyncio.create_task(xp_edit_board(b, st, embed, sig))
+        t = asyncio.create_task(xp_edit_board(b, st, embed, sig))
+        _xp_tasks.add(t)
+        t.add_done_callback(_xp_tasks.discard)
 
 
 async def xp_create_board(channel, guild, kind, period):
