@@ -4006,6 +4006,7 @@ async def xp_voice_loop():
                     if vs.self_deaf or vs.deaf:
                         amount *= XP_VOICE_DEAF_MULT
                     xp_add(guild.id, m.id, "voice", amount, keys)
+                    xp_add(guild.id, m.id, "voice_time", 1, keys)   # کاتی ڤۆیس بە چرکە (deaf یش دەژمێردرێت)
     except Exception as e:
         print(f"xp voice loop error: {e}", flush=True)
 
@@ -4027,10 +4028,19 @@ def xp_top(guild, kind, period):
         m = guild.get_member(int(uid))
         if m is None:
             continue
-        out.append((m, int(val)))
+        secs = None
+        if kind == "voice":
+            secs = xp_bucket(guild.id, "voice_time", period).get(uid, 0)
+        out.append((m, int(val), secs))
         if len(out) >= XP_TOP:
             break
     return out
+
+
+def xp_fmt_time(secs):
+    """11 کاتژمێر و 30 خولەک -> 11:30"""
+    mins = int(secs) // 60
+    return f"{mins // 60}:{mins % 60:02d}"
 
 
 def xp_board_embed(guild, kind, period):
@@ -4042,14 +4052,15 @@ def xp_board_embed(guild, kind, period):
     if not rows:
         lines.append("هێشتا کەس XP ی نییە ♡")
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    for i, (m, v) in enumerate(rows, 1):
+    for i, (m, v, secs) in enumerate(rows, 1):
         name = discord.utils.escape_markdown(m.display_name)[:20]
+        tm = f"  ⏱ `{xp_fmt_time(secs)}`" if secs is not None else ""
         if i <= 3:
-            lines.append(f"{medals[i]}  **{name}**  ⋆  **{v:,}** ✦")
+            lines.append(f"{medals[i]}  **{name}**  ⋆  **{v:,}** ✦{tm}")
             if i == 3 and len(rows) > 3:
                 lines.append("┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈")
         else:
-            lines.append(f"`{i:02d}`  {name}  ⋅  {v:,} ✦")
+            lines.append(f"`{i:02d}`  {name}  ⋅  {v:,} ✦{tm}")
 
     e = discord.Embed(
         title=f"{emoji}  {label} XP  ♡  Top {XP_TOP}",
@@ -4058,7 +4069,10 @@ def xp_board_embed(guild, kind, period):
     )
     if guild.icon:
         e.set_thumbnail(url=guild.icon.url)
-    e.set_footer(text="⟡ نوێ دەبێتەوە هەر چرکەیەک ⟡")
+    foot = "⟡ نوێ دەبێتەوە هەر چرکەیەک ⟡"
+    if kind == "voice":
+        foot += "\n⏱ = کاتژمێر:خولەک لە ڤۆیس"
+    e.set_footer(text=foot)
     return e
 
 
