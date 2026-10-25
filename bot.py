@@ -25,7 +25,7 @@ bot = commands.Bot(command_prefix="", intents=intents, case_insensitive=True)
 # 2. PER-SERVER CONFIG (saved in guild_config.json)
 # =========================================================
 # بۆ ئەوەی ڕێکخستنەکان لە Railway دوای ئەپدەیت/ڕیدیپلۆی نەسڕێنەوە:
-#   1) لە Railway Volume دروست بکەو Mount Path بکە بە  /data
+#   1) لە Railway Volume دروست بکە و Mount Path بکە بە  /data
 #   2) ئەگەر /data هەبێت بۆتەکە خۆکار لەوێ هەڵیدەگرێت
 #   (یان Variable بەناوی CONFIG_PATH دابنێ)
 
@@ -103,8 +103,10 @@ def cfg(guild_id):
     for k in PERM_LABELS:
         perm.setdefault(k, [])
     bl = d.setdefault("perm_blacklist", {})  # users blocked from each permission
-    for k in ("mute", "ban", "safika", "staff", "regri"):
+    for k in ("mute", "ban", "safika", "staff", "regri", "xp"):
         bl.setdefault(k, [])
+    d.setdefault("xp_roles", [])       # roles allowed to use /xp (empty = everyone)
+    d.setdefault("xp_channels", [])    # channels where /xp works (empty = everywhere)
     return d
 
 
@@ -3839,6 +3841,540 @@ async def welcome_cmd(interaction: discord.Interaction):
         view=WelcomeView(interaction.guild, interaction.user.id),
         ephemeral=True
     )
+
+
+# =========================================================
+# 29b. XP SYSTEM  (/xp  +  /setxp)
+# =========================================================
+# - XP دەدرێت بۆ نامەی چات و کاتی ڤۆیس
+# - ڕۆژانە / هەفتانە / مانگانە / ساڵانە (بە کاتی عێراق UTC+3)
+# - /xp  → جۆر (چات/ڤۆیس) → ماوە → بۆردێکی پەبلیک دەنێرێت و خۆکار نوێ دەبێتەوە
+# - /setxp → کێ و لە کوێ بتوانێت /xp بەکاربهێنێت + Blacklist
+# - داتاکە لە xp_data.json هەڵدەگیرێت (لە تەنیشت guild_config.json)
+
+import atexit as _atexit
+import signal as _signal
+import datetime as _dt
+from discord.ext import tasks as _tasks
+
+# ---- ڕێکخستنەکان (دەتوانیت ژمارەکان بگۆڕیت) ----
+XP_TZ = _dt.timezone(_dt.timedelta(hours=3))   # کاتی عێراق
+XP_CHAT_MIN, XP_CHAT_MAX = 8, 14               # XP بۆ هەر نامەیەک
+XP_CHAT_COOLDOWN = 8                           # چرکە: لە ماوەی ئەمەدا نامەی دووەم XP نادات (دژی سپام)
+XP_VOICE_PER_MIN = 10                          # XP بۆ هەر خولەکێک لە ڤۆیس
+XP_VOICE_MIN_HUMANS = 1                        # کەمترین ژمارەی کەس لە ڤۆیس (2 = تەنیا نابێت XP وەربگرێت)
+XP_TOP = 30                                    # چەند کەس لە بۆردەکە
+XP_REFRESH = 1.0                               # هەر چەند چرکە بۆردەکە نوێ بکرێتەوە (1 = کەمترین ڕێگەپێدراو لەلایەن Discord)
+XP_SAVE_EVERY = 15                             # هەر چەند چرکە داتا لەسەر دیسک هەڵبگیرێت
+XP_MAX_BOARDS_PER_GUILD = 12
+
+XP_FILE = os.path.join(os.path.dirname(CONFIG_FILE) or ".", "xp_data.json")
+
+XP_TYPES = {
+    "chat": ("چات", "💬"),
+    "voice": ("ڤۆیس", "🎙️"),
+}
+XP_PERIODS = {
+    "d": "ڕۆژانە",
+    "w": "هەفتانە",
+    "m": "مانگانە",
+    "y": "ساڵانە",
+}
+XP_KEEP = {"d": 45, "w": 20, "m": 26, "y": 10}   # چەند ماوەی کۆن هەڵبگیرێت
+
+try:
+    with open(XP_FILE, "r", encoding="utf-8") as f:
+        xp_db = json.load(f)
+except Exception:
+    xp_db = {}
+xp_db.setdefault("users", {})    # users[guild][kind][period][period_key][user_id] = xp
+xp_db.setdefault("boards", [])   # [{"g","c","m","k","p"}]
+
+_xp_dirty = False
+_xp_board_state = {}             # message_id -> {"sig", "busy", "fails"}
+_xp_chat_last = {}
+
+
+# ---------- داتا ----------
+
+def xp_period_keys(now=None):
+    now = now or _dt.datetime.now(XP_TZ)
+    iso = now.isocalendar()
+    return {
+        "d": now.strftime("%Y-%m-%d"),
+        "w": f"{iso[0]}-W{iso[1]:02d}",
+        "m": now.strftime("%Y-%m"),
+        "y": now.strftime("%Y"),
+    }
+
+
+def xp_add(gid, uid, kind, amount, keys):
+    global _xp_dirty
+    g = xp_db["users"].setdefault(str(gid), {}).setdefault(kind, {})
+    u = str(uid)
+    for p, k in keys.items():
+        bucket = g.setdefault(p, {}).setdefault(k, {})
+        bucket[u] = bucket.get(u, 0.0) + amount
+    _xp_dirty = True
+
+
+def xp_bucket(gid, kind, period):
+    k = xp_period_keys()[period]
+    return xp_db["users"].get(str(gid), {}).get(kind, {}).get(period, {}).get(k, {})
+
+
+def xp_prune():
+    for g in xp_db["users"].values():
+        for kind in g.values():
+            for p, buckets in kind.items():
+                keep = XP_KEEP.get(p, 10)
+                for old in sorted(buckets.keys())[:-keep]:
+                    buckets.pop(old, None)
+
+
+def xp_save_now():
+    global _xp_dirty
+    try:
+        xp_prune()
+        tmp = XP_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(xp_db, f, ensure_ascii=False)
+        os.replace(tmp, XP_FILE)
+        _xp_dirty = False
+    except Exception as e:
+        print(f"xp save error: {e}", flush=True)
+
+
+_atexit.register(xp_save_now)
+
+
+def _xp_on_sigterm(*_):
+    xp_save_now()
+    raise SystemExit(0)
+
+
+try:
+    _signal.signal(_signal.SIGTERM, _xp_on_sigterm)
+except Exception:
+    pass
+
+
+# ---------- وەرگرتنی XP ----------
+
+async def xp_on_message(message):
+    if message.author.bot or message.guild is None:
+        return
+    try:
+        mute_role = get_mute_role(message.guild)
+        if mute_role and mute_role in message.author.roles:
+            return
+    except Exception:
+        pass
+    now = time.time()
+    key = (message.guild.id, message.author.id)
+    if now - _xp_chat_last.get(key, 0) < XP_CHAT_COOLDOWN:
+        return
+    _xp_chat_last[key] = now
+    xp_add(message.guild.id, message.author.id, "chat",
+           random.randint(XP_CHAT_MIN, XP_CHAT_MAX), xp_period_keys())
+
+
+bot.add_listener(xp_on_message, "on_message")
+
+
+@_tasks.loop(seconds=1)
+async def xp_voice_loop():
+    try:
+        keys = xp_period_keys()
+        per_sec = XP_VOICE_PER_MIN / 60.0
+        for guild in bot.guilds:
+            afk = guild.afk_channel
+            for vc in list(guild.voice_channels) + list(guild.stage_channels):
+                if afk and vc.id == afk.id:
+                    continue
+                humans = [m for m in vc.members if not m.bot]
+                if len(humans) < XP_VOICE_MIN_HUMANS:
+                    continue
+                for m in humans:
+                    vs = m.voice
+                    if vs is None or vs.self_deaf or vs.deaf:
+                        continue
+                    xp_add(guild.id, m.id, "voice", per_sec, keys)
+    except Exception as e:
+        print(f"xp voice loop error: {e}", flush=True)
+
+
+@_tasks.loop(seconds=XP_SAVE_EVERY)
+async def xp_save_loop():
+    if _xp_dirty:
+        xp_save_now()
+
+
+# ---------- بۆردی XP ----------
+
+def xp_top(guild, kind, period):
+    bucket = xp_bucket(guild.id, kind, period)
+    out = []
+    for uid, val in sorted(bucket.items(), key=lambda kv: kv[1], reverse=True):
+        if int(val) <= 0:
+            continue
+        m = guild.get_member(int(uid))
+        if m is None:
+            continue
+        out.append((m, int(val)))
+        if len(out) >= XP_TOP:
+            break
+    return out
+
+
+def xp_board_embed(guild, kind, period):
+    label, emoji = XP_TYPES[kind]
+    plabel = XP_PERIODS[period]
+    rows = xp_top(guild, kind, period)
+
+    lines = [f"✧･ﾟ: *✧･ﾟ:*  {plabel}  *:･ﾟ✧*:･ﾟ✧", ""]
+    if not rows:
+        lines.append("هێشتا کەس XP ی نییە ♡")
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    for i, (m, v) in enumerate(rows, 1):
+        name = discord.utils.escape_markdown(m.display_name)[:20]
+        if i <= 3:
+            lines.append(f"{medals[i]}  **{name}**  ⋆  **{v:,}** ✦")
+            if i == 3 and len(rows) > 3:
+                lines.append("┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈")
+        else:
+            lines.append(f"`{i:02d}`  {name}  ⋅  {v:,} ✦")
+
+    e = discord.Embed(
+        title=f"{emoji}  {label} XP  ♡  Top {XP_TOP}",
+        description="\n".join(lines)[:4000],
+        color=discord.Color.from_rgb(244, 208, 238),   # pastel pink-lilac
+    )
+    if guild.icon:
+        e.set_thumbnail(url=guild.icon.url)
+    e.set_footer(text="⟡ نوێ دەبێتەوە هەر چرکەیەک ⟡")
+    return e
+
+
+def _xp_sig(embed):
+    return json.dumps(embed.to_dict(), sort_keys=True, ensure_ascii=False)
+
+
+def xp_remove_board(b):
+    try:
+        xp_db["boards"].remove(b)
+    except ValueError:
+        pass
+    _xp_board_state.pop(b["m"], None)
+    xp_save_now()
+
+
+async def xp_delete_board_message(b):
+    try:
+        await bot.get_partial_messageable(b["c"]).get_partial_message(b["m"]).delete()
+    except Exception:
+        pass
+
+
+async def xp_edit_board(b, st, embed, sig):
+    try:
+        pm = bot.get_partial_messageable(b["c"]).get_partial_message(b["m"])
+        await pm.edit(embed=embed)
+        st["sig"] = sig
+        st["fails"] = 0
+    except discord.NotFound:
+        xp_remove_board(b)
+    except Exception as e:
+        st["fails"] += 1
+        if st["fails"] in (1, 30):
+            print(f"xp board edit error ({st['fails']}): {e}", flush=True)
+        if st["fails"] >= 30 and isinstance(e, discord.Forbidden):
+            xp_remove_board(b)
+    finally:
+        st["busy"] = False
+
+
+@_tasks.loop(seconds=XP_REFRESH)
+async def xp_board_loop():
+    for b in list(xp_db["boards"]):
+        st = _xp_board_state.setdefault(b["m"], {"sig": None, "busy": False, "fails": 0})
+        if st["busy"]:
+            continue
+        guild = bot.get_guild(b["g"])
+        if guild is None:
+            continue
+        try:
+            embed = xp_board_embed(guild, b["k"], b["p"])
+            sig = _xp_sig(embed)
+        except Exception as e:
+            print(f"xp board render error: {e}", flush=True)
+            continue
+        if sig == st["sig"]:
+            continue          # گۆڕانکاری نییە، پێویست بە edit نییە
+        st["busy"] = True
+        asyncio.create_task(xp_edit_board(b, st, embed, sig))
+
+
+async def xp_create_board(channel, guild, kind, period):
+    # ئەگەر هەمان بۆرد لەم کەناڵەدا هەبوو، کۆنەکە بسڕەوە
+    for old in [x for x in xp_db["boards"]
+                if x["g"] == guild.id and x["c"] == channel.id and x["k"] == kind and x["p"] == period]:
+        xp_remove_board(old)
+        await xp_delete_board_message(old)
+
+    embed = xp_board_embed(guild, kind, period)
+    msg = await channel.send(embed=embed)          # پەبلیک، هەموو کەس دەیبینێت
+    b = {"g": guild.id, "c": channel.id, "m": msg.id, "k": kind, "p": period}
+    xp_db["boards"].append(b)
+    _xp_board_state[msg.id] = {"sig": _xp_sig(embed), "busy": False, "fails": 0}
+
+    mine = [x for x in xp_db["boards"] if x["g"] == guild.id]
+    while len(mine) > XP_MAX_BOARDS_PER_GUILD:
+        xp_remove_board(mine.pop(0))
+    xp_save_now()
+    return msg
+
+
+async def xp_on_ready():
+    for loop_ in (xp_voice_loop, xp_save_loop, xp_board_loop):
+        if not loop_.is_running():
+            loop_.start()
+
+
+bot.add_listener(xp_on_ready, "on_ready")
+
+
+# ---------- دەسەڵات ----------
+
+def xp_denied_reason(interaction):
+    """None = دەتوانێت | 'deny' = دەسەڵات نییە | 'channel' = ئەم کەناڵە نابێت"""
+    m = interaction.user
+    g = interaction.guild
+    c = cfg(g.id)
+
+    chans = c["xp_channels"]
+    if chans:
+        ids = {interaction.channel_id, getattr(interaction.channel, "parent_id", None)}
+        if not (ids & set(chans)):
+            return "channel"
+
+    if m.id == g.owner_id:
+        return None
+    if is_blacklisted(m, "xp"):
+        return "deny"
+    if is_dev(m):
+        return None
+    roles = c["xp_roles"]
+    if roles and not any(r.id in roles for r in m.roles):
+        return "deny"
+    return None
+
+
+async def xp_deny(interaction, why):
+    if why == "channel":
+        chans = " ".join(f"<#{x}>" for x in cfg(interaction.guild.id)["xp_channels"])
+        try:
+            await interaction.response.send_message(
+                f"ئەم فەرمانە لێرە ناکرێت، لەم کەناڵانە بەکاری بهێنە:\n{chans}",
+                ephemeral=True, delete_after=10)
+        except Exception:
+            pass
+    else:
+        await deny_interaction(interaction)
+
+
+# ---------- /xp ----------
+
+def xp_step_embed(kind=None):
+    if kind is None:
+        return discord.Embed(
+            title="✦ XP ✦",
+            description="جۆری XP هەڵبژێرە ♡",
+            color=discord.Color.from_rgb(244, 208, 238))
+    label, emoji = XP_TYPES[kind]
+    return discord.Embed(
+        title=f"{emoji} {label} XP",
+        description="ماوەکە هەڵبژێرە ♡",
+        color=discord.Color.from_rgb(244, 208, 238))
+
+
+class XpKindView(discord.ui.View):
+    def __init__(self, author_id):
+        super().__init__(timeout=120)
+        self.author_id = author_id
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.author_id:
+            await deny_interaction(interaction)
+            return False
+        return True
+
+    async def _pick(self, interaction, kind):
+        await interaction.response.edit_message(
+            embed=xp_step_embed(kind), view=XpPeriodView(self.author_id, kind))
+
+    @discord.ui.button(label="چات", emoji="💬", style=discord.ButtonStyle.secondary)
+    async def chat_btn(self, interaction, button):
+        await self._pick(interaction, "chat")
+
+    @discord.ui.button(label="ڤۆیس", emoji="🎙️", style=discord.ButtonStyle.secondary)
+    async def voice_btn(self, interaction, button):
+        await self._pick(interaction, "voice")
+
+
+class XpPeriodView(discord.ui.View):
+    def __init__(self, author_id, kind):
+        super().__init__(timeout=120)
+        self.author_id = author_id
+        self.kind = kind
+        for p, label in XP_PERIODS.items():
+            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, row=0)
+            btn.callback = self._make_cb(p)
+            self.add_item(btn)
+        back = discord.ui.Button(label="گەڕانەوە", emoji="↩️", style=discord.ButtonStyle.primary, row=1)
+        back.callback = self._back
+        self.add_item(back)
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.author_id:
+            await deny_interaction(interaction)
+            return False
+        return True
+
+    def _make_cb(self, period):
+        async def cb(interaction):
+            why = xp_denied_reason(interaction)
+            if why:
+                await xp_deny(interaction, why)
+                return
+            await interaction.response.edit_message(
+                embed=discord.Embed(
+                    description=f"✅ بۆردی **{XP_TYPES[self.kind][0]} · {XP_PERIODS[period]}** نێردرا",
+                    color=discord.Color.from_rgb(244, 208, 238)),
+                view=None)
+            try:
+                await xp_create_board(interaction.channel, interaction.guild, self.kind, period)
+            except discord.Forbidden:
+                await interaction.followup.send(
+                    "نەمتوانی لەم کەناڵە بنێرم، دەسەڵاتی Send Messages و Embed Links بدە بە بۆتەکە.",
+                    ephemeral=True)
+            except Exception as e:
+                print(f"xp create board error: {e}", flush=True)
+                await interaction.followup.send("هەڵەیەک ڕوویدا، دووبارە هەوڵ بدەوە.", ephemeral=True)
+        return cb
+
+    async def _back(self, interaction):
+        await interaction.response.edit_message(embed=xp_step_embed(), view=XpKindView(self.author_id))
+
+
+@bot.tree.command(name="xp", description="تۆپی XP ی چات و ڤۆیس پیشان بدە")
+@app_commands.guild_only()
+async def xp_cmd(interaction: discord.Interaction):
+    why = xp_denied_reason(interaction)
+    if why:
+        await xp_deny(interaction, why)
+        return
+    await interaction.response.send_message(
+        embed=xp_step_embed(), view=XpKindView(interaction.user.id), ephemeral=True)
+
+
+# ---------- /setxp ----------
+
+def xpset_embed(guild):
+    c = cfg(guild.id)
+    roles = " ".join(f"<@&{r}>" for r in c["xp_roles"]) or "🌍 هەموو کەسێک"
+    chans = " ".join(f"<#{x}>" for x in c["xp_channels"]) or "🌍 هەموو شوێنێک"
+    bl = " ".join(f"<@{u}>" for u in blacklist_list(guild.id, "xp")) or "❌"
+    e = discord.Embed(title="✦ XP Settings", color=discord.Color.from_rgb(244, 208, 238))
+    e.add_field(name="ڕۆڵەکان (کێ بتوانێت)", value=roles[:1000], inline=False)
+    e.add_field(name="کەناڵەکان (لە کوێ بتوانرێت)", value=chans[:1000], inline=False)
+    e.add_field(name="🚫 Blacklist", value=bl[:1000], inline=False)
+    e.set_footer(text="ڕۆڵ/کەناڵ: هەڵبژاردنی نوێ لیستی پێشوو دەگۆڕێت | Blacklist: زیاد / لابردن | بەتاڵ = هەموو شوێن و کەس")
+    return e
+
+
+class XpRolesSelect(discord.ui.RoleSelect):
+    def __init__(self):
+        super().__init__(placeholder="ڕۆڵەکان هەڵبژێرە (کێ بتوانێت /xp بەکاربهێنێت)...",
+                         min_values=1, max_values=25, row=0)
+
+    async def callback(self, interaction):
+        g = self.view.guild
+        cfg(g.id)["xp_roles"][:] = [r.id for r in self.values]
+        save_config()
+        await interaction.response.edit_message(
+            embed=xpset_embed(g), view=XpSetView(g, self.view.author_id))
+
+
+class XpChannelsSelect(discord.ui.ChannelSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="کەناڵەکان هەڵبژێرە (لە کوێ بتوانرێت)...",
+            channel_types=[discord.ChannelType.text, discord.ChannelType.voice, discord.ChannelType.news],
+            min_values=1, max_values=25, row=1)
+
+    async def callback(self, interaction):
+        g = self.view.guild
+        cfg(g.id)["xp_channels"][:] = [ch.id for ch in self.values]
+        save_config()
+        await interaction.response.edit_message(
+            embed=xpset_embed(g), view=XpSetView(g, self.view.author_id))
+
+
+class XpBlacklistSelect(discord.ui.UserSelect):
+    def __init__(self):
+        super().__init__(placeholder="🚫 Blacklist — کەس هەڵبژێرە (زیاد / لابردن)...",
+                         min_values=1, max_values=25, row=2)
+
+    async def callback(self, interaction):
+        g = self.view.guild
+        _toggle_ids(blacklist_list(g.id, "xp"), [u.id for u in self.values])
+        save_config()
+        await interaction.response.edit_message(
+            embed=xpset_embed(g), view=XpSetView(g, self.view.author_id))
+
+
+class XpSetView(SecBaseView):
+    def __init__(self, guild, author_id):
+        super().__init__(guild, author_id)
+        self.add_item(XpRolesSelect())
+        self.add_item(XpChannelsSelect())
+        self.add_item(XpBlacklistSelect())
+
+    async def _refresh(self, interaction):
+        await interaction.response.edit_message(
+            embed=xpset_embed(self.guild), view=XpSetView(self.guild, self.author_id))
+
+    @discord.ui.button(label="هەموو کەسێک", emoji="🌍", style=discord.ButtonStyle.secondary, row=3)
+    async def all_people(self, interaction, button):
+        cfg(self.guild.id)["xp_roles"][:] = []
+        save_config()
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="هەموو شوێنێک", emoji="🌍", style=discord.ButtonStyle.secondary, row=3)
+    async def all_places(self, interaction, button):
+        cfg(self.guild.id)["xp_channels"][:] = []
+        save_config()
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="Clear Blacklist", style=discord.ButtonStyle.danger, row=3)
+    async def clear_bl(self, interaction, button):
+        blacklist_list(self.guild.id, "xp")[:] = []
+        save_config()
+        await self._refresh(interaction)
+
+
+@bot.tree.command(name="setxp", description="ڕێکخستنی /xp: کێ و لە کوێ بتوانێت بەکاری بهێنێت")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def setxp_cmd(interaction: discord.Interaction):
+    if not is_dev(interaction.user):
+        await deny_interaction(interaction)
+        return
+    await interaction.response.send_message(
+        embed=xpset_embed(interaction.guild),
+        view=XpSetView(interaction.guild, interaction.user.id),
+        ephemeral=True)
 
 
 # =========================================================
