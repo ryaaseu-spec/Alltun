@@ -4048,31 +4048,30 @@ def xp_board_embed(guild, kind, period):
     plabel = XP_PERIODS[period]
     rows = xp_top(guild, kind, period)
 
-    lines = [f"✧･ﾟ: *✧･ﾟ:*  {plabel}  *:･ﾟ✧*:･ﾟ✧", ""]
+    lines = [f"✧･ﾟ:  {plabel}  :･ﾟ✧", ""]
     if not rows:
         lines.append("هێشتا کەس XP ی نییە ♡")
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     for i, (m, v, secs) in enumerate(rows, 1):
-        name = discord.utils.escape_markdown(m.display_name)[:20]
-        tm = f"  ⏱ `{xp_fmt_time(secs)}`" if secs is not None else ""
+        name = discord.utils.escape_markdown(m.display_name)[: (14 if secs is not None else 20)]
+        # کاتی ڤۆیس ڕێک لە تەنیشت XP، لە هەمان ڕیز (کورت بۆ ئەوەی لە مۆبایل نەشکێتەوە)
+        tail = f" ⋅ {xp_fmt_time(secs)}" if secs is not None else " ✦"
         if i <= 3:
-            lines.append(f"{medals[i]}  **{name}**  ⋆  **{v:,}** ✦{tm}")
+            lines.append(f"{medals[i]} **{name}** ⋆ **{v:,}**{tail}")
             if i == 3 and len(rows) > 3:
-                lines.append("┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈")
+                lines.append("┈┈┈┈┈┈┈┈┈┈┈┈")
         else:
-            lines.append(f"`{i:02d}`  {name}  ⋅  {v:,} ✦{tm}")
+            lines.append(f"`{i:02d}` {name} ⋅ {v:,}{tail}")
 
     e = discord.Embed(
         title=f"{emoji}  {label} XP  ♡  Top {XP_TOP}",
         description="\n".join(lines)[:4000],
         color=discord.Color.from_rgb(244, 208, 238),   # pastel pink-lilac
     )
-    if guild.icon:
-        e.set_thumbnail(url=guild.icon.url)
     foot = "⟡ نوێ دەبێتەوە هەر چرکەیەک ⟡"
     if kind == "voice":
-        foot += "\n⏱ = کاتژمێر:خولەک لە ڤۆیس"
-    e.set_footer(text=foot)
+        foot += "\nXP ⋅ ⏱ کاتژمێر:خولەک لە ڤۆیس"
+    e.set_footer(text=foot, icon_url=guild.icon.url if guild.icon else None)
     return e
 
 
