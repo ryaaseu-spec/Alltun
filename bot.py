@@ -4053,11 +4053,12 @@ def xp_board_embed(guild, kind, period):
         lines.append("هێشتا کەس XP ی نییە ♡")
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     for i, (m, v, secs) in enumerate(rows, 1):
-        name = discord.utils.escape_markdown(m.display_name)[: (14 if secs is not None else 20)]
-        # کاتی ڤۆیس ڕێک لە تەنیشت XP، لە هەمان ڕیز (کورت بۆ ئەوەی لە مۆبایل نەشکێتەوە)
-        tail = f" ⋅ {xp_fmt_time(secs)}" if secs is not None else " ✦"
+        name = discord.utils.escape_markdown(m.display_name)[: (12 if secs is not None else 20)]
+        # کاتی ڤۆیس ڕێک لە تەنیشت XP، لە هەمان ڕیز: XP ✦ ⏱ `کات`
+        tail = f" ✦ `{xp_fmt_time(secs)}`" if secs is not None else " ✦"
         if i <= 3:
-            lines.append(f"{medals[i]} **{name}** ⋆ **{v:,}**{tail}")
+            xp_txt = f"{v:,}" if secs is not None else f"**{v:,}**"
+            lines.append(f"{medals[i]} **{name}** ⋆ {xp_txt}{tail}")
             if i == 3 and len(rows) > 3:
                 lines.append("┈┈┈┈┈┈┈┈┈┈┈┈")
         else:
@@ -4070,7 +4071,7 @@ def xp_board_embed(guild, kind, period):
     )
     foot = "⟡ نوێ دەبێتەوە هەر چرکەیەک ⟡"
     if kind == "voice":
-        foot += "\nXP ⋅ ⏱ کاتژمێر:خولەک لە ڤۆیس"
+        foot += "\nکات = کاتژمێر:خولەک لە ڤۆیس"
     e.set_footer(text=foot, icon_url=guild.icon.url if guild.icon else None)
     return e
 
