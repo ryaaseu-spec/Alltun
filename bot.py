@@ -4481,13 +4481,32 @@ _love_last = {}
 _LOVE_ACTION_WORDS = {w: k for k, v in LOVE_ACTIONS.items() for w in v["words"]}
 
 
+# ڕێژەکان: (لە, تا, ئەگەر %) ـی هەر بەشێک. سەروو 70 کەمە، سەروو 80 زۆر کەمترە
+LOVE_BUCKETS = [
+    (0,  19, 15),
+    (20, 39, 25),
+    (40, 59, 27),
+    (60, 69, 15),
+    (70, 79, 9),
+    (80, 89, 6),
+    (90, 100, 3),
+]
+
+
 def love_percent(a_id, b_id):
-    """ڕێژەی نێوان دوو کەس، هەموو ڕۆژێک نوێ دەبێتەوە، A&B و B&A هەمان ڕێژەیان هەیە"""
+    """ڕێژەی نێوان دوو کەس، هەموو ڕۆژێک نوێ دەبێتەوە، A&B و B&A هەمان ڕێژەیان هەیە.
+    ڕاندۆمە بەڵام قورسە: زۆربەی جار کەم/ناوەند دێت و سەروو 70 و 80 کەم دەردەکەوێت"""
     import hashlib
     x, y = sorted((int(a_id), int(b_id)))
     day = xp_period_keys()["d"]
     h = hashlib.sha256(f"{x}:{y}:{day}".encode()).digest()
-    return int.from_bytes(h[:4], "big") % 101
+    pick = int.from_bytes(h[:4], "big") % 100          # 0..99 بۆ هەڵبژاردنی بەش
+    acc = 0
+    for lo, hi, w in LOVE_BUCKETS:
+        acc += w
+        if pick < acc:
+            return lo + int.from_bytes(h[4:8], "big") % (hi - lo + 1)
+    return 50
 
 
 def get_lv(gid):
