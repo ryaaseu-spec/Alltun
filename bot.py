@@ -4406,6 +4406,205 @@ async def setxp_cmd(interaction: discord.Interaction):
 
 
 # =========================================================
+# 29c. LOVE + ACTIONS  (ship / kiss / hug / pat)
+# =========================================================
+# - بنووسە:  ship @کەس   (یان وەڵامی نامەی کەسێک بدەوە بە ship)
+#   ڕێژەی خۆشەویستی نێوان تۆ و ئەو کەسە پیشان دەدات
+# - ڕێژەکە بۆ هەر دووکەس هەموو ڕۆژێک نوێ دەبێتەوە (بە کاتی عێراق)،
+#   لە هەمان ڕۆژدا هەر جارێک بپرسیت هەمان ڕێژە دەدات
+# - ship @a @b  → ڕێژەی نێوان ئەو دوو کەسە
+# - kiss / hug / pat @کەس → ماچ / باوەش / نازدان
+# ناوی فەرمانەکان لێرە دەتوانیت بیانگۆڕیت:
+
+LOVE_WORDS = ["ship"]
+LOVE_ACTIONS = {
+    "kiss": {
+        "words": ["kiss", "mach"],
+        "emoji": "💋",
+        "title": "ماچ",
+        "color": (255, 205, 222),
+        "lines": [
+            "ماچێکی ناسک لەسەر ڕوومەت 🤍",
+            "ماچێکی بچووک و بێدەنگ ✨",
+            "ماچێک وەک پەپولەیەک نیشتەوە 🦋",
+            "ماچێکی شیرین و شەرمنانە 🌷",
+        ],
+        "count": "جار ماچی کردووە",
+    },
+    "hug": {
+        "words": ["hug", "bawesh"],
+        "emoji": "🫶",
+        "title": "باوەش",
+        "color": (224, 208, 250),
+        "lines": [
+            "باوەشێکی گەرم و ئارام ☁️",
+            "باوەشێک کە هەموو شتێک ئارام دەکاتەوە 🤍",
+            "باوەشێکی توند و پڕ لە خۆشەویستی 💗",
+            "باوەشێکی نەرم وەک هەور ☁️",
+        ],
+        "count": "جار باوەشی پێداکردووە",
+    },
+    "pat": {
+        "words": ["pat", "naz"],
+        "emoji": "🎀",
+        "title": "نازدان",
+        "color": (255, 226, 212),
+        "lines": [
+            "دەستێکی نەرم بەسەر سەریدا هات 🌷",
+            "نازێکی بچووک و شیرین 🎀",
+            "بە ناسکی ناز کرا ✨",
+            "دەستێکی ئارامکەرەوە 🤍",
+        ],
+        "count": "جار نازی کردووە",
+    },
+}
+
+LOVE_COOLDOWN = 3          # چرکە: لە نێوان دوو فەرمانی یەک کەس
+LOVE_LEVELS = [            # (تا چەند %, ستێت)
+    (9,   "One-Sided Love 💔"),
+    (19,  "Toxic Love 🥀"),
+    (29,  "Forbidden Love 🖤"),
+    (39,  "Secret Love 🤫"),
+    (49,  "Platonic Love 🫂"),
+    (59,  "Family Love 🏡"),
+    (69,  "First Love 🌷"),
+    (79,  "Romantic Love ❤️"),
+    (89,  "True Love 🤍"),
+    (99,  "Eternal Love 💍"),
+    (100, "Unconditional Love ♾️"),
+]
+LOVE_SELF = "Self Love 🖤"
+
+xp_db.setdefault("love", {})     # love[guild]["a>b"][action] = ژمارە
+_love_last = {}
+
+_LOVE_ACTION_WORDS = {w: k for k, v in LOVE_ACTIONS.items() for w in v["words"]}
+
+
+def love_percent(a_id, b_id):
+    """ڕێژەی نێوان دوو کەس، هەموو ڕۆژێک نوێ دەبێتەوە، A&B و B&A هەمان ڕێژەیان هەیە"""
+    import hashlib
+    x, y = sorted((int(a_id), int(b_id)))
+    day = xp_period_keys()["d"]
+    h = hashlib.sha256(f"{x}:{y}:{day}".encode()).digest()
+    return int.from_bytes(h[:4], "big") % 101
+
+
+def love_status(p):
+    for limit, label in LOVE_LEVELS:
+        if p <= limit:
+            return label
+    return LOVE_LEVELS[-1][1]
+
+
+def love_bar(p):
+    full = round(p / 10)
+    return "🩷" * full + "🤍" * (10 - full)
+
+
+def love_embed(a, b):
+    p = 100 if a.id == b.id else love_percent(a.id, b.id)
+    text = LOVE_SELF if a.id == b.id else love_status(p)
+    desc = (
+        "₊˚⊹ ♡ ⋆｡˚ ✧ ˚｡⋆ ♡ ⊹˚₊\n\n"
+        f"{a.mention}  ˖ ♡ ˖  {b.mention}\n\n"
+        f"## ♡ {p}% ♡\n"
+        f"{love_bar(p)}\n\n"
+        f"**{text}**\n\n"
+        "-# ⋆ ڕێژەکە هەموو ڕۆژێک نوێ دەبێتەوە ⋆"
+    )
+    e = discord.Embed(description=desc, color=discord.Color.from_rgb(250, 205, 235))
+    e.set_author(name="ڕێژەی خۆشەویستی", icon_url=a.display_avatar.url)
+    e.set_thumbnail(url=b.display_avatar.url)
+    return e
+
+
+def love_count(gid, a_id, b_id, action):
+    """ژمارەی جارەکان، A بۆ B (لە یەک ئاراستەدا) و دەیگەڕێنێتەوە"""
+    global _xp_dirty
+    g = xp_db["love"].setdefault(str(gid), {})
+    rec = g.setdefault(f"{a_id}>{b_id}", {})
+    rec[action] = rec.get(action, 0) + 1
+    _xp_dirty = True
+    return rec[action]
+
+
+def action_embed(a, b, action, n):
+    spec = LOVE_ACTIONS[action]
+    desc = (
+        "₊˚⊹ ♡ ⋆｡˚ ✧ ˚｡⋆ ♡ ⊹˚₊\n\n"
+        f"{a.mention}  {spec['emoji']}  {b.mention}\n\n"
+        f"{random.choice(spec['lines'])}\n\n"
+        f"-# ⋆ {n} {spec['count']} ⋆"
+    )
+    e = discord.Embed(description=desc, color=discord.Color.from_rgb(*spec["color"]))
+    e.set_author(name=spec["title"], icon_url=a.display_avatar.url)
+    e.set_thumbnail(url=b.display_avatar.url)
+    return e
+
+
+async def love_on_message(message):
+    if message.author.bot or message.guild is None or not message.content:
+        return
+    parts = message.content.strip().split()
+    if not parts:
+        return
+    word = parts[0].lower()
+    is_love = word in LOVE_WORDS
+    action = _LOVE_ACTION_WORDS.get(word)
+    if not is_love and not action:
+        return
+
+    # کەسەکان: mention ـەکان، یان ئەو کەسەی وەڵامی نامەکەی دراوەتەوە
+    targets = [u for u in message.mentions if not u.bot]
+    if not targets and message.reference and message.reference.message_id:
+        try:
+            ref = message.reference.resolved
+            if ref is None or isinstance(ref, discord.DeletedReferencedMessage):
+                ref = await message.channel.fetch_message(message.reference.message_id)
+            if ref and not ref.author.bot:
+                targets = [ref.author]
+        except Exception:
+            pass
+
+    async def hint(text):
+        try:
+            await message.channel.send(f"{message.author.mention} {text}", delete_after=8)
+        except Exception:
+            pass
+
+    if not targets:
+        if len(parts) == 1:        # تەنها وشەکە بەتەنیا، ڕێنمایی بکە
+            await hint("کەسێک mention بکە 🌷")
+        return
+
+    now = time.time()
+    if now - _love_last.get(message.author.id, 0) < LOVE_COOLDOWN:
+        return
+    _love_last[message.author.id] = now
+
+    me = message.author
+    try:
+        if is_love:
+            a, b = (targets[0], targets[1]) if len(targets) >= 2 else (me, targets[0])
+            embed = love_embed(a, b)
+        else:
+            b = targets[0]
+            if b.id == me.id:
+                await hint("ناتوانیت ئەمە بۆ خۆت بکەیت 🥺")
+                return
+            n = love_count(message.guild.id, me.id, b.id, action)
+            embed = action_embed(me, b, action, n)
+        await message.reply(embed=embed, mention_author=False,
+                            allowed_mentions=discord.AllowedMentions.none())
+    except Exception as e:
+        print(f"love command error: {e}", flush=True)
+
+
+bot.add_listener(love_on_message, "on_message")
+
+
+# =========================================================
 # 30. RUN
 # =========================================================
 
