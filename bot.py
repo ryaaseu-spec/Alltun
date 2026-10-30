@@ -4690,17 +4690,174 @@ def love_count(gid, a_id, b_id, action):
     return rec[action]
 
 
-def action_embed(a, b, action, n):
+# ---------------------------------------------------------
+# gender (بە ڕۆڵ) + وێنەی ئەنیمی بۆ kiss / hug / pat
+# ---------------------------------------------------------
+# - هەموو شتێک لە /setlove ـەوە: ڕۆڵی کچ/کوڕ، زیادکردن و لابردنی gif
+# - ڕۆڵ دیاری نەکرابێت = هەر جارێک جۆرێکی هەڕەمەکی (زیاتر کچ + کچ)
+# - هەر جارێک ئەنیمییەکی جیاواز لە لیستی ANIME_QUERIES هەڵدەبژێردرێت و
+#   gif ی ئەو ئەنیمییە لە nekos.best وەردەگیرێت، بۆیە هەمیشە شتی نوێ دێت
+# - gif ی خۆت (لە /setlove) تێکەڵ دەکرێت لەگەڵیان
+
+GIF_CATS = {
+    "gg": "کچ + کچ",
+    "bg": "کچ + کوڕ",
+    "bb": "کوڕ + کوڕ",
+}
+_NEKOS_ENDPOINT = {"kiss": "kiss", "hug": "hug", "pat": "pat"}
+
+# ناوی ئەنیمی بۆ گەڕان (دەتوانیت زیادی بکەیت یان کەمی بکەیتەوە)
+ANIME_QUERIES = {
+    "gg": [
+        "Sakura Trick", "Citrus", "Bloom Into You", "Yagate Kimi ni Naru",
+        "Adachi to Shimamura", "Sasameki Koto", "Strawberry Panic", "Kase-san",
+        "Yuru Yuri", "Whisper Me a Love Song", "Maria-sama ga Miteru",
+        "Assault Lily", "Revolutionary Girl Utena", "Sailor Moon", "Love Live",
+        "Lycoris Recoil", "Netsuzou Trap", "Kiniro Mosaic", "Akuma no Riddle",
+        "Violet Evergarden", "Kuzu no Honkai", "Wataten", "Hanjuku", "Girlfriend",
+        "K-On", "Bocchi", "Little Witch Academia", "Madoka Magica", "Hibike",
+    ],
+    "bg": [
+        "Toradora", "Horimiya", "Kaguya-sama", "Kimi no Na wa", "Tenki no Ko",
+        "Clannad", "Tonikaku Kawaii", "Fruits Basket", "Kimi ni Todoke",
+        "Ao Haru Ride", "Lovely Complex", "Nana", "Spice and Wolf", "Oregairu",
+        "Seishun Buta Yarou", "Kaichou wa Maid-sama", "Shigatsu wa Kimi no Uso",
+        "Sukitte Ii na yo", "Ore Monogatari", "Skip to Loafer", "Komi",
+        "Kobayashi-san", "Kanojo Okarishimasu", "Nisekoi", "Wotakoi",
+        "Karakai Jouzu no Takagi-san", "Violet Evergarden", "Kamisama Kiss",
+        "Ouran", "Special A", "Itazura na Kiss", "Golden Time", "Hyouka",
+    ],
+    "bb": [
+        "Given", "Yuri on Ice", "Sasaki to Miyano", "Doukyuusei", "Banana Fish",
+        "Junjou Romantica", "Free!", "Kuroko no Basket", "Haikyuu", "Blue Lock",
+        "Ensemble Stars", "Jujutsu Kaisen", "Naruto", "Attack on Titan",
+        "Bungou Stray Dogs", "Tokyo Revengers", "Hunter x Hunter",
+        "Fullmetal Alchemist", "Kimetsu no Yaiba", "Hetalia", "Natsume Yuujinchou",
+        "Fugou Keiji", "Yaoi",
+    ],
+}
+# ڕۆڵ دیاری نەکرابێت: ڕێژەی هەڵبژاردنی هەر جۆرێک
+UNKNOWN_CAT_WEIGHTS = {"gg": 5, "bg": 3, "bb": 2}
+_last_gif = {}
+
+
+def random_category():
+    return random.choices(list(UNKNOWN_CAT_WEIGHTS), weights=list(UNKNOWN_CAT_WEIGHTS.values()))[0]
+
+
+def get_gif_cfg(gid):
+    c = cfg(gid)
+    g = c.setdefault("gender", {"girl": None, "boy": None})
+    gifs = c.setdefault("action_gifs", {})
+    for act in LOVE_ACTIONS:
+        d = gifs.setdefault(act, {})
+        for k in GIF_CATS:
+            d.setdefault(k, [])
+    return g, gifs
+
+
+def member_gender(member, gid):
+    g, _ = get_gif_cfg(gid)
+    try:
+        ids = {r.id for r in member.roles}
+    except Exception:
+        return None
+    is_girl = g["girl"] in ids if g["girl"] else False
+    is_boy = g["boy"] in ids if g["boy"] else False
+    if is_girl and not is_boy:
+        return "g"
+    if is_boy and not is_girl:
+        return "b"
+    return None
+
+
+def pair_category(a, b, gid):
+    ga, gb = member_gender(a, gid), member_gender(b, gid)
+    if ga is None or gb is None:
+        return None
+    if ga == "g" and gb == "g":
+        return "gg"
+    if ga == "b" and gb == "b":
+        return "bb"
+    return "bg"
+
+
+async def _http_json(url, params=None):
+    import aiohttp
+    timeout = aiohttp.ClientTimeout(total=6)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        async with s.get(url, params=params) as r:
+            if r.status != 200:
+                return None
+            return await r.json()
+
+
+def _choose_new(urls, key):
+    """هەڵبژاردنی هەڕەمەکی، بێ دووبارەبوونەوەی gif ی پێشوو"""
+    if not urls:
+        return None
+    pool = [u for u in urls if u != _last_gif.get(key)] or urls
+    u = random.choice(pool)
+    _last_gif[key] = u
+    return u
+
+
+async def fetch_anime_gif(action, cat=None):
+    """gif ی ئەنیمی: یەکەم گەڕان بە ناوی ئەنیمی، پاشان nekos.best ی ئاسایی، پاشان waifu.pics"""
+    key = (action, cat)
+    endpoint = _NEKOS_ENDPOINT[action]
+    queries = ANIME_QUERIES.get(cat) or []
+    for q in random.sample(queries, min(3, len(queries))):
+        try:
+            data = await _http_json("https://nekos.best/api/v2/search",
+                                    {"query": q, "type": 2, "category": endpoint, "amount": 20})
+            urls = [r["url"] for r in (data or {}).get("results", []) if r.get("url")]
+            u = _choose_new(urls, key)
+            if u:
+                return u
+        except Exception as ex:
+            print(f"nekos.best search error: {ex}", flush=True)
+    try:
+        data = await _http_json(f"https://nekos.best/api/v2/{endpoint}", {"amount": 10})
+        u = _choose_new([r["url"] for r in (data or {}).get("results", []) if r.get("url")], key)
+        if u:
+            return u
+    except Exception as ex:
+        print(f"nekos.best error: {ex}", flush=True)
+    try:
+        data = await _http_json(f"https://api.waifu.pics/sfw/{endpoint}")
+        return (data or {}).get("url")
+    except Exception as ex:
+        print(f"waifu.pics error: {ex}", flush=True)
+    return None
+
+
+async def pick_action_gif(guild_id, action, cat):
+    _, gifs = get_gif_cfg(guild_id)
+    if cat is None:
+        cat = random_category()
+    pool = gifs[action].get(cat) or []
+    if pool and random.random() < 0.6:       # gif ی خۆت زۆرتر دەردەکەوێت
+        return _choose_new(pool, (action, cat, "own"))
+    url = await fetch_anime_gif(action, cat)
+    if not url and pool:
+        url = _choose_new(pool, (action, cat, "own"))
+    return url
+
+
+async def action_embed(a, b, action, n, gid, cat="auto"):
     spec = LOVE_ACTIONS[action]
+    if cat == "auto":
+        cat = pair_category(a, b, gid)
+    url = await pick_action_gif(gid, action, cat)
     desc = (
-        "₊˚⊹ ♡ ⋆｡˚ ✧ ˚｡⋆ ♡ ⊹˚₊\n\n"
         f"{a.mention}  {spec['emoji']}  {b.mention}\n\n"
-        f"{random.choice(spec['lines'])}\n\n"
         f"-# ⋆ {n} {spec['count']} ⋆"
     )
     e = discord.Embed(description=desc, color=discord.Color.from_rgb(*spec["color"]))
     e.set_author(name=spec["title"], icon_url=a.display_avatar.url)
-    e.set_thumbnail(url=b.display_avatar.url)
+    if url:
+        e.set_image(url=url)
     return e
 
 
@@ -4760,7 +4917,7 @@ async def love_on_message(message):
                 await hint("ناتوانیت ئەمە بۆ خۆت بکەیت 🥺")
                 return
             n = love_count(message.guild.id, me.id, b.id, action)
-            embed = action_embed(me, b, action, n)
+            embed = await action_embed(me, b, action, n, message.guild.id)
         if is_love:
             await message.reply(embed=embed, file=lfile, mention_author=False,
                                 allowed_mentions=discord.AllowedMentions.none())
@@ -4798,6 +4955,16 @@ def lv_embed(guild):
     e = discord.Embed(title="💗 Love Settings", color=discord.Color.from_rgb(250, 205, 235))
     e.add_field(name="کەناڵەکان (ship / kiss / hug / pat)", value=chans[:1000], inline=False)
     e.add_field(name="دەقی ڕێژەکان", value="\n".join(lines)[:1000], inline=False)
+    g, gifs = get_gif_cfg(guild.id)
+    e.add_field(
+        name="کچ / کوڕ (بۆ جۆری gif)",
+        value=(f"👧 {('<@&%d>' % g['girl']) if g['girl'] else '❌'}   👦 {('<@&%d>' % g['boy']) if g['boy'] else '❌'}\n"
+               "-# ڕۆڵ دیاری نەکرابێت = هەرجارە جۆرێکی هەڕەمەکی"),
+        inline=False)
+    own = []
+    for act, spec in LOVE_ACTIONS.items():
+        own.append(f"{spec['emoji']} " + " · ".join(f"{len(gifs[act][k])}" for k in GIF_CATS))
+    e.add_field(name="gif ی خۆت (کچ+کچ · کچ+کوڕ · کوڕ+کوڕ)", value="\n".join(own), inline=False)
     e.set_footer(text="✏️ = دەقی خۆت | بەتاڵ بنووسیت دەگەڕێتەوە بۆ دیفەڵت | کەناڵ هەڵبژێریت لیستی پێشوو دەگۆڕێت")
     return e
 
@@ -4872,11 +5039,110 @@ class LvPreviewModal(discord.ui.Modal):
         await interaction.followup.send(embed=embed, file=lfile, ephemeral=True)
 
 
+class LvActionPreviewSelect(discord.ui.Select):
+    """Preview ی kiss / hug / pat بۆ هەر جۆرێک (کچ+کچ، کچ+کوڕ، کوڕ+کوڕ)"""
+    def __init__(self):
+        opts = [
+            discord.SelectOption(label=f"{spec['title']} · {label}", value=f"{act}|{k}", emoji=spec["emoji"])
+            for act, spec in LOVE_ACTIONS.items() for k, label in GIF_CATS.items()
+        ]
+        super().__init__(placeholder="Preview ی ماچ / باوەش / نازدان...", options=opts, row=3)
+
+    async def callback(self, interaction):
+        act, cat = self.values[0].split("|")
+        await interaction.response.defer(ephemeral=True)
+        embed = await action_embed(interaction.user, interaction.guild.me, act, 1,
+                                   interaction.guild.id, cat)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+class LvGifAddModal(discord.ui.Modal):
+    def __init__(self, guild, author_id):
+        super().__init__(title="Add GIF")
+        self.guild, self.author_id = guild, author_id
+        self.act = discord.ui.TextInput(label="فەرمان: kiss / hug / pat", max_length=10)
+        self.cat = discord.ui.TextInput(label="جۆر: gg (کچ+کچ) / bg (کچ+کوڕ) / bb (کوڕ+کوڕ)", max_length=2)
+        self.links = discord.ui.TextInput(label="لینکی gif (چەند لینک بە دوای یەک)",
+                                          style=discord.TextStyle.paragraph, max_length=2000)
+        for i in (self.act, self.cat, self.links):
+            self.add_item(i)
+
+    async def on_submit(self, interaction):
+        act = _LOVE_ACTION_WORDS.get(self.act.value.strip().lower())
+        cat = self.cat.value.strip().lower()
+        if not act or cat not in GIF_CATS:
+            await interaction.response.send_message("❌ فەرمان یان جۆر هەڵەیە.", ephemeral=True)
+            return
+        _, gifs = get_gif_cfg(self.guild.id)
+        lst = gifs[act][cat]
+        added = 0
+        for u in re.findall(r"https?://\S+", self.links.value):
+            if u not in lst:
+                lst.append(u)
+                added += 1
+        save_config()
+        await interaction.response.send_message(
+            f"✅ {added} gif زیادکرا بۆ **{LOVE_ACTIONS[act]['title']} / {GIF_CATS[cat]}** (کۆی گشتی {len(lst)})",
+            ephemeral=True)
+
+
+class LvGifRemoveModal(discord.ui.Modal):
+    def __init__(self, guild, author_id):
+        super().__init__(title="Remove GIF")
+        self.guild, self.author_id = guild, author_id
+        self.act = discord.ui.TextInput(label="فەرمان: kiss / hug / pat", max_length=10)
+        self.cat = discord.ui.TextInput(label="جۆر: gg / bg / bb", max_length=2)
+        self.num = discord.ui.TextInput(label="ژمارە (یان all بۆ سڕینەوەی هەموو)", max_length=5)
+        for i in (self.act, self.cat, self.num):
+            self.add_item(i)
+
+    async def on_submit(self, interaction):
+        act = _LOVE_ACTION_WORDS.get(self.act.value.strip().lower())
+        cat = self.cat.value.strip().lower()
+        if not act or cat not in GIF_CATS:
+            await interaction.response.send_message("❌ فەرمان یان جۆر هەڵەیە.", ephemeral=True)
+            return
+        _, gifs = get_gif_cfg(self.guild.id)
+        lst = gifs[act][cat]
+        v = self.num.value.strip().lower()
+        if v == "all":
+            lst.clear()
+        elif v.isdecimal() and 1 <= int(v) <= len(lst):
+            lst.pop(int(v) - 1)
+        else:
+            await interaction.response.send_message("❌ ژمارەکە هەڵەیە.", ephemeral=True)
+            return
+        save_config()
+        await interaction.response.send_message("🗑️ لابرا.", ephemeral=True)
+
+
+class LvGenderRole(discord.ui.RoleSelect):
+    def __init__(self, key, placeholder, row):
+        super().__init__(placeholder=placeholder, min_values=1, max_values=1, row=row)
+        self.key = key
+
+    async def callback(self, interaction):
+        g, _ = get_gif_cfg(interaction.guild.id)
+        g[self.key] = self.values[0].id
+        save_config()
+        await interaction.response.send_message(
+            f"✅ {self.values[0].mention}", ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none())
+
+
+class LvGenderView(SecBaseView):
+    def __init__(self, guild, author_id):
+        super().__init__(guild, author_id)
+        self.add_item(LvGenderRole("girl", "ڕۆڵی کچان 👧", 0))
+        self.add_item(LvGenderRole("boy", "ڕۆڵی کوڕان 👦", 1))
+
+
 class LvView(SecBaseView):
     def __init__(self, guild, author_id):
         super().__init__(guild, author_id)
         self.add_item(LvChannelSelect())
         self.add_item(LvLevelSelect(guild))
+        self.add_item(LvActionPreviewSelect())
 
     @discord.ui.button(label="Preview", style=discord.ButtonStyle.success, row=2)
     async def preview_btn(self, interaction, button):
@@ -4888,6 +5154,19 @@ class LvView(SecBaseView):
         save_config()
         await interaction.response.edit_message(
             embed=lv_embed(self.guild), view=LvView(self.guild, self.author_id))
+
+    @discord.ui.button(label="Add GIF", emoji="➕", style=discord.ButtonStyle.primary, row=4)
+    async def addgif_btn(self, interaction, button):
+        await interaction.response.send_modal(LvGifAddModal(self.guild, self.author_id))
+
+    @discord.ui.button(label="Remove GIF", emoji="🗑️", style=discord.ButtonStyle.secondary, row=4)
+    async def delgif_btn(self, interaction, button):
+        await interaction.response.send_modal(LvGifRemoveModal(self.guild, self.author_id))
+
+    @discord.ui.button(label="کچ / کوڕ", emoji="👫", style=discord.ButtonStyle.secondary, row=4)
+    async def gender_btn(self, interaction, button):
+        await interaction.response.send_message(
+            "ڕۆڵی کچان و کوڕان هەڵبژێرە:", view=LvGenderView(self.guild, self.author_id), ephemeral=True)
 
     @discord.ui.button(label="هەموو کەناڵێک", emoji="🌍", style=discord.ButtonStyle.secondary, row=2)
     async def all_btn(self, interaction, button):
@@ -4908,6 +5187,7 @@ async def setlove_cmd(interaction: discord.Interaction):
         embed=lv_embed(interaction.guild),
         view=LvView(interaction.guild, interaction.user.id),
         ephemeral=True)
+
 
 
 # =========================================================
