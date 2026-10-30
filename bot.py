@@ -4747,7 +4747,10 @@ def random_category():
 
 def get_gif_cfg(gid):
     c = cfg(gid)
-    g = c.setdefault("gender", {"girl": None, "boy": None})
+    g = c.setdefault("gender", {"girl": [], "boy": []})
+    for k in ("girl", "boy"):      # ڕێکخستنی کۆن (یەک ڕۆڵ) دەگۆڕێت بۆ لیست
+        v = g.get(k)
+        g[k] = [v] if isinstance(v, int) else (v if isinstance(v, list) else [])
     gifs = c.setdefault("action_gifs", {})
     for act in LOVE_ACTIONS:
         d = gifs.setdefault(act, {})
@@ -4762,8 +4765,8 @@ def member_gender(member, gid):
         ids = {r.id for r in member.roles}
     except Exception:
         return None
-    is_girl = g["girl"] in ids if g["girl"] else False
-    is_boy = g["boy"] in ids if g["boy"] else False
+    is_girl = any(r in ids for r in g["girl"])
+    is_boy = any(r in ids for r in g["boy"])
     if is_girl and not is_boy:
         return "g"
     if is_boy and not is_girl:
@@ -4958,7 +4961,8 @@ def lv_embed(guild):
     g, gifs = get_gif_cfg(guild.id)
     e.add_field(
         name="کچ / کوڕ (بۆ جۆری gif)",
-        value=(f"👧 {('<@&%d>' % g['girl']) if g['girl'] else '❌'}   👦 {('<@&%d>' % g['boy']) if g['boy'] else '❌'}\n"
+        value=(f"👧 {' '.join('<@&%d>' % r for r in g['girl']) or '❌'}\n"
+               f"👦 {' '.join('<@&%d>' % r for r in g['boy']) or '❌'}\n"
                "-# ڕۆڵ دیاری نەکرابێت = هەرجارە جۆرێکی هەڕەمەکی"),
         inline=False)
     own = []
@@ -5118,23 +5122,23 @@ class LvGifRemoveModal(discord.ui.Modal):
 
 class LvGenderRole(discord.ui.RoleSelect):
     def __init__(self, key, placeholder, row):
-        super().__init__(placeholder=placeholder, min_values=1, max_values=1, row=row)
+        super().__init__(placeholder=placeholder, min_values=1, max_values=25, row=row)
         self.key = key
 
     async def callback(self, interaction):
         g, _ = get_gif_cfg(interaction.guild.id)
-        g[self.key] = self.values[0].id
+        g[self.key] = [r.id for r in self.values]
         save_config()
         await interaction.response.send_message(
-            f"✅ {self.values[0].mention}", ephemeral=True,
+            "✅ " + " ".join(r.mention for r in self.values), ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none())
 
 
 class LvGenderView(SecBaseView):
     def __init__(self, guild, author_id):
         super().__init__(guild, author_id)
-        self.add_item(LvGenderRole("girl", "ڕۆڵی کچان 👧", 0))
-        self.add_item(LvGenderRole("boy", "ڕۆڵی کوڕان 👦", 1))
+        self.add_item(LvGenderRole("girl", "ڕۆڵەکانی کچان 👧 (چەند ڕۆڵ)", 0))
+        self.add_item(LvGenderRole("boy", "ڕۆڵەکانی کوڕان 👦 (چەند ڕۆڵ)", 1))
 
 
 class LvView(SecBaseView):
@@ -5166,7 +5170,7 @@ class LvView(SecBaseView):
     @discord.ui.button(label="کچ / کوڕ", emoji="👫", style=discord.ButtonStyle.secondary, row=4)
     async def gender_btn(self, interaction, button):
         await interaction.response.send_message(
-            "ڕۆڵی کچان و کوڕان هەڵبژێرە:", view=LvGenderView(self.guild, self.author_id), ephemeral=True)
+            "ڕۆڵەکانی کچان و کوڕان هەڵبژێرە (هەر جارێک هەڵبژێریت لیستی پێشوو دەگۆڕێت):", view=LvGenderView(self.guild, self.author_id), ephemeral=True)
 
     @discord.ui.button(label="هەموو کەناڵێک", emoji="🌍", style=discord.ButtonStyle.secondary, row=2)
     async def all_btn(self, interaction, button):
