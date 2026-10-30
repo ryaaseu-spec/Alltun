@@ -4712,10 +4712,9 @@ ANIME_QUERIES = {
         "Sakura Trick", "Citrus", "Bloom Into You", "Yagate Kimi ni Naru",
         "Adachi to Shimamura", "Sasameki Koto", "Strawberry Panic", "Kase-san",
         "Yuru Yuri", "Whisper Me a Love Song", "Maria-sama ga Miteru",
-        "Assault Lily", "Revolutionary Girl Utena", "Sailor Moon", "Love Live",
-        "Lycoris Recoil", "Netsuzou Trap", "Kiniro Mosaic", "Akuma no Riddle",
-        "Violet Evergarden", "Kuzu no Honkai", "Wataten", "Hanjuku", "Girlfriend",
-        "K-On", "Bocchi", "Little Witch Academia", "Madoka Magica", "Hibike",
+        "Assault Lily", "Love Live", "Lycoris Recoil", "Netsuzou Trap",
+        "Kiniro Mosaic", "Akuma no Riddle", "Wataten", "Yuri Kuma Arashi",
+        "Sweet Blue Flowers", "Aoi Hana", "K-On", "Bocchi", "Madoka Magica",
     ],
     "bg": [
         "Toradora", "Horimiya", "Kaguya-sama", "Kimi no Na wa", "Tenki no Ko",
@@ -4737,7 +4736,8 @@ ANIME_QUERIES = {
     ],
 }
 # ڕۆڵ دیاری نەکرابێت: ڕێژەی هەڵبژاردنی هەر جۆرێک
-UNKNOWN_CAT_WEIGHTS = {"gg": 5, "bg": 3, "bb": 2}
+UNKNOWN_CAT_WEIGHTS = {"gg": 7, "bg": 2, "bb": 1}
+STRICT_CATS = ("gg", "bb")   # ئەم جۆرانە هەرگیز gif ی تێکەڵ ناگرن
 _last_gif = {}
 
 
@@ -4776,8 +4776,10 @@ def member_gender(member, gid):
 
 def pair_category(a, b, gid):
     ga, gb = member_gender(a, gid), member_gender(b, gid)
-    if ga is None or gb is None:
-        return None
+    if ga is None and gb is None:
+        return None                      # هیچیان ڕۆڵیان نییە: هەڕەمەکی (زیاتر کچ + کچ)
+    if ga is None or gb is None:         # یەکێکیان ڕۆڵی نییە: بە ڕۆڵی ئەوی تر دەزانین
+        return "gg" if (ga or gb) == "g" else "bg"
     if ga == "g" and gb == "g":
         return "gg"
     if ga == "b" and gb == "b":
@@ -4805,21 +4807,37 @@ def _choose_new(urls, key):
     return u
 
 
+def _name_ok(name, q):
+    """ناوی ئەنیمییەکە دەبێت وەک ئەو ناوەی گەڕاوین بێت (nekos.best هەندێجار نزیک دەدۆزێتەوە)"""
+    n = re.sub(r"[^a-z0-9]", "", (name or "").lower())
+    k = re.sub(r"[^a-z0-9]", "", (q or "").lower())
+    return bool(n and k) and (k in n or n in k)
+
+
 async def fetch_anime_gif(action, cat=None):
-    """gif ی ئەنیمی: یەکەم گەڕان بە ناوی ئەنیمی، پاشان nekos.best ی ئاسایی، پاشان waifu.pics"""
+    """gif ی ئەنیمی. بۆ gg و bb تەنها ئەنیمییە دیاریکراوەکان؛ هەرگیز gif ی هەڕەمەکی/تێکەڵ نادات"""
     key = (action, cat)
     endpoint = _NEKOS_ENDPOINT[action]
+    strict = cat in STRICT_CATS
     queries = ANIME_QUERIES.get(cat) or []
-    for q in random.sample(queries, min(3, len(queries))):
+    for q in random.sample(queries, min(8 if strict else 3, len(queries))):
         try:
             data = await _http_json("https://nekos.best/api/v2/search",
                                     {"query": q, "type": 2, "category": endpoint, "amount": 20})
-            urls = [r["url"] for r in (data or {}).get("results", []) if r.get("url")]
+            urls = []
+            for r in (data or {}).get("results", []):
+                if not r.get("url"):
+                    continue
+                if strict and not _name_ok(r.get("anime_name"), q):
+                    continue
+                urls.append(r["url"])
             u = _choose_new(urls, key)
             if u:
                 return u
         except Exception as ex:
             print(f"nekos.best search error: {ex}", flush=True)
+    if strict:
+        return None          # ئەگەر نەدۆزرایەوە باشترە gif نەبێت لە gif ی هەڵە
     try:
         data = await _http_json(f"https://nekos.best/api/v2/{endpoint}", {"amount": 10})
         u = _choose_new([r["url"] for r in (data or {}).get("results", []) if r.get("url")], key)
