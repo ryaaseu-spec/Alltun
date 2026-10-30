@@ -4490,10 +4490,18 @@ def love_percent(a_id, b_id):
     return int.from_bytes(h[:4], "big") % 101
 
 
-def love_status(p):
+def get_lv(gid):
+    l = cfg(gid).setdefault("love", {})
+    l.setdefault("channels", [])   # بەتاڵ = ship لە هەموو کەناڵێک کار دەکات
+    l.setdefault("texts", {})      # {"9": "دەقی نوێ", ..., "self": "..."} (نەبوو = دیفەڵت)
+    return l
+
+
+def love_status(p, gid=None):
+    texts = get_lv(gid)["texts"] if gid else {}
     for limit, label in LOVE_LEVELS:
         if p <= limit:
-            return label
+            return texts.get(str(limit)) or label
     return LOVE_LEVELS[-1][1]
 
 
@@ -4502,9 +4510,12 @@ def love_bar(p):
     return "🩷" * full + "🤍" * (10 - full)
 
 
-def love_embed(a, b):
-    p = 100 if a.id == b.id else love_percent(a.id, b.id)
-    text = LOVE_SELF if a.id == b.id else love_status(p)
+def love_embed(a, b, gid=None, percent=None):
+    p = percent if percent is not None else (100 if a.id == b.id else love_percent(a.id, b.id))
+    if percent is None and a.id == b.id:
+        text = (get_lv(gid)["texts"].get("self") if gid else None) or LOVE_SELF
+    else:
+        text = love_status(p, gid)
     desc = (
         "₊˚⊹ ♡ ⋆｡˚ ✧ ˚｡⋆ ♡ ⊹˚₊\n\n"
         f"{a.mention}  ˖ ♡ ˖  {b.mention}\n\n"
@@ -4555,6 +4566,11 @@ async def love_on_message(message):
     if not is_love and not action:
         return
 
+    lv_chans = get_lv(message.guild.id)["channels"]
+    ch_ = message.channel
+    if lv_chans and ch_.id not in lv_chans and getattr(ch_, "parent_id", None) not in lv_chans:
+        return
+
     # کەسەکان: mention ـەکان، یان ئەو کەسەی وەڵامی نامەکەی دراوەتەوە
     targets = [u for u in message.mentions if not u.bot]
     if not targets and message.reference and message.reference.message_id:
@@ -4587,7 +4603,7 @@ async def love_on_message(message):
     try:
         if is_love:
             a, b = (targets[0], targets[1]) if len(targets) >= 2 else (me, targets[0])
-            embed = love_embed(a, b)
+            embed = love_embed(a, b, message.guild.id)
         else:
             b = targets[0]
             if b.id == me.id:
@@ -4602,6 +4618,141 @@ async def love_on_message(message):
 
 
 bot.add_listener(love_on_message, "on_message")
+
+
+# ---------------------------------------------------------
+# /setlove  (کەناڵی ship + دەقی ڕێژەکان)
+# ---------------------------------------------------------
+
+def love_ranges():
+    """[(key, '0-9%', default_text)] + self"""
+    out, prev = [], 0
+    for limit, label in LOVE_LEVELS:
+        out.append((str(limit), f"{prev}-{limit}%", label))
+        prev = limit + 1
+    out.append(("self", "Self (خۆت + خۆت)", LOVE_SELF))
+    return out
+
+
+def lv_embed(guild):
+    lv = get_lv(guild.id)
+    chans = " ".join(f"<#{c}>" for c in lv["channels"]) or "🌍 هەموو کەناڵێک"
+    lines = []
+    for key, rng, default in love_ranges():
+        custom = lv["texts"].get(key)
+        lines.append(f"`{rng}` ⋅ {custom + ' ✏️' if custom else default}")
+    e = discord.Embed(title="💗 Love Settings", color=discord.Color.from_rgb(250, 205, 235))
+    e.add_field(name="کەناڵەکان (ship / kiss / hug / pat)", value=chans[:1000], inline=False)
+    e.add_field(name="دەقی ڕێژەکان", value="\n".join(lines)[:1000], inline=False)
+    e.set_footer(text="✏️ = دەقی خۆت | بەتاڵ بنووسیت دەگەڕێتەوە بۆ دیفەڵت | کەناڵ هەڵبژێریت لیستی پێشوو دەگۆڕێت")
+    return e
+
+
+class LvChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="کەناڵەکان هەڵبژێرە (چەند کەناڵ)...",
+            channel_types=[discord.ChannelType.text, discord.ChannelType.news, discord.ChannelType.voice],
+            min_values=1, max_values=25, row=0)
+
+    async def callback(self, interaction):
+        g = self.view.guild
+        get_lv(g.id)["channels"][:] = [c.id for c in self.values]
+        save_config()
+        await interaction.response.edit_message(embed=lv_embed(g), view=LvView(g, self.view.author_id))
+
+
+class LvLevelSelect(discord.ui.Select):
+    def __init__(self, guild):
+        lv = get_lv(guild.id)
+        opts = []
+        for key, rng, default in love_ranges():
+            cur = lv["texts"].get(key) or default
+            opts.append(discord.SelectOption(label=rng, value=key, description=cur[:100]))
+        super().__init__(placeholder="ڕێژەیەک هەڵبژێرە بۆ گۆڕینی دەقەکەی...", options=opts, row=1)
+
+    async def callback(self, interaction):
+        await interaction.response.send_modal(
+            LvTextModal(self.view.guild, self.view.author_id, self.values[0]))
+
+
+class LvTextModal(discord.ui.Modal):
+    def __init__(self, guild, author_id, key):
+        super().__init__(title="Love Text")
+        self.guild, self.author_id, self.key = guild, author_id, key
+        rng, default = next((r, d) for k, r, d in love_ranges() if k == key)
+        cur = get_lv(guild.id)["texts"].get(key)
+        self.box = discord.ui.TextInput(
+            label=f"دەقی {rng} (بەتاڵ = دیفەڵت)"[:45], default=cur or None,
+            placeholder=default[:100], required=False, max_length=100)
+        self.add_item(self.box)
+
+    async def on_submit(self, interaction):
+        texts = get_lv(self.guild.id)["texts"]
+        v = self.box.value.strip()
+        if v:
+            texts[self.key] = v
+        else:
+            texts.pop(self.key, None)
+        save_config()
+        await interaction.response.edit_message(
+            embed=lv_embed(self.guild), view=LvView(self.guild, self.author_id))
+
+
+class LvPreviewModal(discord.ui.Modal):
+    def __init__(self, guild):
+        super().__init__(title="Preview")
+        self.guild = guild
+        self.pct = discord.ui.TextInput(
+            label="ڕێژە 0 تا 100 (بەتاڵ = ئەمڕۆی تۆ و بۆت)", required=False, max_length=3)
+        self.add_item(self.pct)
+
+    async def on_submit(self, interaction):
+        v = self.pct.value.strip()
+        if v and (not v.isdecimal() or int(v) > 100):
+            await interaction.response.send_message("❌ ژمارەیەک لە 0 تا 100 بنووسە.", ephemeral=True)
+            return
+        me = self.guild.me
+        embed = love_embed(interaction.user, me, self.guild.id, int(v) if v else None)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class LvView(SecBaseView):
+    def __init__(self, guild, author_id):
+        super().__init__(guild, author_id)
+        self.add_item(LvChannelSelect())
+        self.add_item(LvLevelSelect(guild))
+
+    @discord.ui.button(label="Preview", style=discord.ButtonStyle.success, row=2)
+    async def preview_btn(self, interaction, button):
+        await interaction.response.send_modal(LvPreviewModal(self.guild))
+
+    @discord.ui.button(label="Reset Texts", style=discord.ButtonStyle.danger, row=2)
+    async def reset_btn(self, interaction, button):
+        get_lv(self.guild.id)["texts"].clear()
+        save_config()
+        await interaction.response.edit_message(
+            embed=lv_embed(self.guild), view=LvView(self.guild, self.author_id))
+
+    @discord.ui.button(label="هەموو کەناڵێک", emoji="🌍", style=discord.ButtonStyle.secondary, row=2)
+    async def all_btn(self, interaction, button):
+        get_lv(self.guild.id)["channels"][:] = []
+        save_config()
+        await interaction.response.edit_message(
+            embed=lv_embed(self.guild), view=LvView(self.guild, self.author_id))
+
+
+@bot.tree.command(name="setlove", description="کەناڵی ship و دەقی ڕێژەکانی خۆشەویستی")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def setlove_cmd(interaction: discord.Interaction):
+    if not is_dev(interaction.user):
+        await deny_interaction(interaction)
+        return
+    await interaction.response.send_message(
+        embed=lv_embed(interaction.guild),
+        view=LvView(interaction.guild, interaction.user.id),
+        ephemeral=True)
 
 
 # =========================================================
