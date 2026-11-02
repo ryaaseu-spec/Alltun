@@ -5395,6 +5395,479 @@ async def create_channels_cmd(interaction: discord.Interaction):
 
 
 # =========================================================
+# 29e. SONG TEXTS  (/song-texts)  — هەموو کەسێک دەتوانێت بەکاری بهێنێت
+# =========================================================
+# پانێلێک (تەنها بۆ خۆی دیارە):
+#   🎤 ناوی گۆرانیبێژ + ناوی گۆرانی  |  📝 تێکست  |  🖼 وێنە  |  🎧 فایل (MP3 / ئۆدیۆ / ڤیدیۆ)
+#   🔤 فۆنتی ناوی گۆرانیبێژ  |  👁 Preview  |  📤 Send
+# Send → بۆردێکی جوان + وێنە + فایلی MP3 بە شێوەی پەبلیک دەنێرێت بۆ ناو چاتەکە
+# ڤیدیۆ یان ئۆدیۆی تر خۆکار دەگۆڕدرێت بۆ MP3 (پێویستی بە ffmpeg هەیە):
+#   Railway: لە requirements.txt بنووسە  imageio-ffmpeg  (یان ffmpeg لە nixpacks زیاد بکە)
+
+import io as _io
+import shutil as _shutil
+import tempfile as _tempfile
+
+SONG_COLOR = discord.Color.from_rgb(250, 205, 235)
+SONG_COOLDOWN = 30                    # چرکە لە نێوان دوو ناردنی یەک کەس
+SONG_WAIT = 120                       # چرکە بۆ ناردنی وێنە/فایل
+SONG_MAX_IMG = 8 * 1024 * 1024
+SONG_MAX_IN = 100 * 1024 * 1024       # گەورەترین فایلی ڤیدیۆ/ئۆدیۆ کە وەربگیرێت
+SONG_AUDIO_EXT = {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac", ".opus", ".wma", ".oga", ".amr"}
+SONG_VIDEO_EXT = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".3gp", ".flv", ".wmv"}
+SONG_IMG_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}
+_song_last = {}
+
+
+# ---------- فۆنتەکان (پیتی لاتینی) ----------
+
+def _song_range(up, low):
+    def f(ch):
+        o = ord(ch)
+        if 65 <= o <= 90:
+            return chr(up + o - 65)
+        if 97 <= o <= 122:
+            return chr(low + o - 97)
+        return ch
+    return f
+
+
+_SMALLCAPS = dict(zip("abcdefghijklmnopqrstuvwxyz", "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀꜱᴛᴜᴠᴡxʏᴢ"))
+
+SONG_FONTS = {
+    "script":     ("Script",      _song_range(0x1D4D0, 0x1D4EA)),
+    "fraktur":    ("Fraktur",     _song_range(0x1D56C, 0x1D586)),
+    "bold":       ("Bold",        _song_range(0x1D400, 0x1D41A)),
+    "bolditalic": ("Bold Italic", _song_range(0x1D468, 0x1D482)),
+    "mono":       ("Mono",        _song_range(0x1D670, 0x1D68A)),
+    "smallcaps":  ("Small Caps",  lambda ch: _SMALLCAPS.get(ch.lower(), ch) if ch.isascii() and ch.isalpha() else ch),
+    "normal":     ("Normal",      lambda ch: ch),
+}
+
+
+def song_style(text, font):
+    fn = SONG_FONTS.get(font, SONG_FONTS["script"])[1]
+    return "".join(fn(c) for c in text)
+
+
+# ---------- یارمەتیدەرەکان ----------
+
+class SongSession:
+    def __init__(self):
+        self.artist = ""
+        self.title = ""
+        self.lyrics = ""
+        self.cover = None
+        self.cover_fn = None
+        self.audio = None
+        self.audio_ext = ".mp3"
+        self.font = "script"
+        self.note = ""
+
+    def clear_files(self):
+        self.cover = None
+        self.audio = None
+
+
+def song_filename(s):
+    base = f"{s.artist} - {s.title}" if s.artist else s.title
+    base = re.sub(r'[\\/:*?"<>|\r\n\t]+', " ", base)
+    base = re.sub(r"\s+", " ", base).strip()[:80] or "song"
+    return base + s.audio_ext
+
+
+def song_split(text, limit=3500):
+    pages, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if cur:
+                pages.append(cur)
+                cur = ""
+            pages.append(line[:limit])
+            line = line[limit:]
+        add = (cur + "\n" + line) if cur else line
+        if len(add) > limit:
+            pages.append(cur)
+            cur = line
+        else:
+            cur = add
+    if cur:
+        pages.append(cur)
+    return pages or [""]
+
+
+def song_size(n):
+    return f"{n / 1024 / 1024:.1f} MB"
+
+
+def song_build(s, user):
+    """بۆرد(ەکان): یەکەم بۆرد سەر + تێکست، ئەگەر تێکست درێژ بوو بۆردی زیاتر"""
+    text = re.sub(r"\n{3,}", "\n\n", s.lyrics.strip())
+    pages = song_split(discord.utils.escape_markdown(text))
+    head = "₊˚⊹ ♡ ⋆｡˚ ✧ ˚｡⋆ ♡ ⊹˚₊"
+    desc = head + (f"\n\n>>> {pages[0]}" if text else "")
+    e = discord.Embed(title=f"♪ {s.title}"[:250], description=desc[:4000], color=SONG_COLOR)
+    if s.artist:
+        e.set_author(name=song_style(s.artist, s.font)[:250])
+    if s.cover_fn:
+        e.set_thumbnail(url=f"attachment://{s.cover_fn}")
+    e.set_footer(text=f"♡ {user.display_name}", icon_url=user.display_avatar.url)
+    embeds = [e]
+    if text:
+        for p in pages[1:]:
+            embeds.append(discord.Embed(description=f">>> {p}"[:4000], color=SONG_COLOR))
+    return embeds
+
+
+def song_files(s, with_audio):
+    files = []
+    if s.cover and s.cover_fn:
+        files.append(discord.File(_io.BytesIO(s.cover), filename=s.cover_fn))
+    if with_audio and s.audio:
+        files.append(discord.File(_io.BytesIO(s.audio), filename=song_filename(s)))
+    return files
+
+
+def song_panel_embed(s):
+    ok, no = "✅", "⬜"
+    artist = song_style(s.artist, s.font) if s.artist else no
+    lines = [
+        f"🎤 **گۆرانیبێژ:** {artist}",
+        f"🎵 **گۆرانی:** {s.title or no}",
+        f"📝 **تێکست:** {f'{ok} {len(s.lyrics):,} پیت' if s.lyrics else no}",
+        f"🖼 **وێنە:** {f'{ok} {song_size(len(s.cover))}' if s.cover else no}",
+        f"🎧 **فایل:** {f'{ok} {song_filename(s)} ⋅ {song_size(len(s.audio))}' if s.audio else no}",
+        f"🔤 **فۆنت:** {SONG_FONTS[s.font][0]}",
+    ]
+    e = discord.Embed(
+        title="🎶 Song Texts",
+        description="\n".join(lines) + "\n\n-# هەموو بەشەکان ئارەزوومەندانەن، تەنها ناوی گۆرانی پێویستە ⋆ پاشان 👁 Preview و 📤 Send",
+        color=SONG_COLOR)
+    if s.note:
+        e.add_field(name="ℹ️", value=s.note[:500], inline=False)
+    return e
+
+
+# ---------- ffmpeg ----------
+
+def song_ffmpeg():
+    p = _shutil.which("ffmpeg")
+    if p:
+        return p
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+async def song_to_mp3(data, in_name, limit):
+    """(bytes, None) یان (None, هۆکار)"""
+    ff = song_ffmpeg()
+    if not ff:
+        return None, "no-ffmpeg"
+    ext = os.path.splitext(in_name)[1].lower()
+    if not re.fullmatch(r"\.[a-z0-9]{1,5}", ext):
+        ext = ".bin"
+    with _tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "in" + ext)
+        dst = os.path.join(d, "out.mp3")
+        with open(src, "wb") as f:
+            f.write(data)
+        for br in ("128k", "96k", "64k"):
+            proc = await asyncio.create_subprocess_exec(
+                ff, "-y", "-i", src, "-vn", "-map", "0:a:0", "-c:a", "libmp3lame",
+                "-b:a", br, "-ar", "44100", dst,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=300)
+            except asyncio.TimeoutError:
+                proc.kill()
+                return None, "timeout"
+            if proc.returncode != 0 or not os.path.exists(dst):
+                return None, "ffmpeg-fail"
+            with open(dst, "rb") as f:
+                out = f.read()
+            if len(out) <= limit:
+                return out, None
+        return None, "too-big"
+
+
+# ---------- مۆدالەکان ----------
+
+class SongInfoModal(discord.ui.Modal, title="ناوی گۆرانیبێژ و گۆرانی"):
+    def __init__(self, view):
+        super().__init__()
+        self.sv = view
+        self.artist = discord.ui.TextInput(
+            label="ناوی گۆرانیبێژ", default=view.s.artist, required=False, max_length=60)
+        self.song = discord.ui.TextInput(
+            label="ناوی گۆرانی", default=view.s.title, required=True, max_length=80)
+        self.add_item(self.artist)
+        self.add_item(self.song)
+
+    async def on_submit(self, interaction):
+        s = self.sv.s
+        s.artist = self.artist.value.strip()
+        s.title = self.song.value.strip()
+        s.note = ""
+        await interaction.response.edit_message(embed=song_panel_embed(s), view=self.sv)
+
+
+class SongLyricsModal(discord.ui.Modal, title="تێکستی گۆرانی"):
+    def __init__(self, view):
+        super().__init__()
+        self.sv = view
+        self.text = discord.ui.TextInput(
+            label="تێکست (بەتاڵ = لابردن)", style=discord.TextStyle.paragraph,
+            default=view.s.lyrics or None, required=False, max_length=4000)
+        self.add_item(self.text)
+
+    async def on_submit(self, interaction):
+        s = self.sv.s
+        s.lyrics = self.text.value.strip()
+        s.note = ""
+        await interaction.response.edit_message(embed=song_panel_embed(s), view=self.sv)
+
+
+class SongFontSelect(discord.ui.Select):
+    def __init__(self, current):
+        opts = [discord.SelectOption(label=name, value=k, description=song_style("Marsa", k),
+                                     default=(k == current))
+                for k, (name, _) in SONG_FONTS.items()]
+        super().__init__(placeholder="🔤 فۆنتی ناوی گۆرانیبێژ...", options=opts, row=1)
+
+    async def callback(self, interaction):
+        sv = self.view
+        sv.s.font = self.values[0]
+        for o in self.options:
+            o.default = (o.value == sv.s.font)
+        await interaction.response.edit_message(embed=song_panel_embed(sv.s), view=sv)
+
+
+# ---------- پانێل ----------
+
+class SongView(discord.ui.View):
+    def __init__(self, root, session):
+        super().__init__(timeout=14 * 60)
+        self.root = root                      # ئینتەراکشنی /song-texts بۆ نوێکردنەوەی پانێل
+        self.s = session
+        self.author_id = root.user.id
+        self.add_item(SongFontSelect(session.font))
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.author_id:
+            try:
+                await interaction.response.send_message(
+                    "ئەمە پانێلی کەسێکی ترە، خۆت /song-texts بکەرەوە 🌷", ephemeral=True, delete_after=8)
+            except Exception:
+                pass
+            return False
+        return True
+
+    async def on_timeout(self):
+        self.s.clear_files()
+        try:
+            await self.root.edit_original_response(
+                embed=discord.Embed(description="⏱ کاتەکە بەسەرچوو، دووبارە /song-texts بکەرەوە", color=SONG_COLOR),
+                view=None)
+        except Exception:
+            pass
+
+    async def _refresh(self):
+        try:
+            await self.root.edit_original_response(embed=song_panel_embed(self.s), view=self)
+        except Exception:
+            pass
+
+    async def _ask_upload(self, interaction, prompt):
+        """چاوەڕێی ناردنی فایل دەکات لەم کەناڵە. (message, attachment) یان None"""
+        await interaction.response.send_message(prompt, ephemeral=True)
+
+        def check(m):
+            return (m.author.id == self.author_id and m.channel.id == interaction.channel_id
+                    and m.attachments)
+        try:
+            m = await bot.wait_for("message", check=check, timeout=SONG_WAIT)
+        except asyncio.TimeoutError:
+            await interaction.edit_original_response(content="⏱ کات بەسەرچوو، دووبارە هەوڵ بدەوە")
+            return None
+        return m, m.attachments[0]
+
+    async def _done(self, interaction, text):
+        self.s.note = text
+        await self._refresh()
+        try:
+            await interaction.edit_original_response(content=text)
+            await asyncio.sleep(4)
+            await interaction.delete_original_response()
+        except Exception:
+            pass
+
+    @discord.ui.button(label="Artist & Song", emoji="🎤", style=discord.ButtonStyle.primary, row=0)
+    async def info_btn(self, interaction, button):
+        await interaction.response.send_modal(SongInfoModal(self))
+
+    @discord.ui.button(label="Lyrics", emoji="📝", style=discord.ButtonStyle.secondary, row=0)
+    async def lyrics_btn(self, interaction, button):
+        await interaction.response.send_modal(SongLyricsModal(self))
+
+    @discord.ui.button(label="Cover", emoji="🖼", style=discord.ButtonStyle.secondary, row=0)
+    async def cover_btn(self, interaction, button):
+        got = await self._ask_upload(
+            interaction, f"🖼 وێنەی گۆرانییەکە لەم کەناڵە بنێرە ({SONG_WAIT} چرکە)")
+        if not got:
+            return
+        m, att = got
+        ct = (att.content_type or "").split(";")[0].lower()
+        if ct not in SONG_IMG_EXT:
+            await self._done(interaction, "❌ تەنها وێنە (PNG / JPG / WEBP / GIF) قبوڵ دەکرێت")
+            return
+        if att.size > SONG_MAX_IMG:
+            await self._done(interaction, f"❌ وێنەکە گەورەترە لە {song_size(SONG_MAX_IMG)}")
+            return
+        data = await att.read()
+        try:
+            await m.delete()                 # نامەی وێنەکەی خۆت دەسڕێتەوە (ئەگەر دەسەڵات هەبوو)
+        except Exception:
+            pass
+        self.s.cover = data
+        self.s.cover_fn = f"cover.{SONG_IMG_EXT[ct]}"
+        await self._done(interaction, "✅ وێنە وەرگیرا")
+
+    @discord.ui.button(label="Audio / Video", emoji="🎧", style=discord.ButtonStyle.secondary, row=0)
+    async def audio_btn(self, interaction, button):
+        got = await self._ask_upload(
+            interaction,
+            f"🎧 فایلی گۆرانی (MP3 / ئۆدیۆ) یان ڤیدیۆ لەم کەناڵە بنێرە ({SONG_WAIT} چرکە)\n"
+            "-# ڤیدیۆ خۆکار دەگۆڕدرێت بۆ MP3")
+        if not got:
+            return
+        m, att = got
+        name = att.filename or "file"
+        ext = os.path.splitext(name)[1].lower()
+        ct = (att.content_type or "").split(";")[0].lower()
+        is_audio = ct.startswith("audio/") or ext in SONG_AUDIO_EXT
+        is_video = ct.startswith("video/") or ext in SONG_VIDEO_EXT
+        if not (is_audio or is_video):
+            await self._done(interaction, "❌ تەنها ئۆدیۆ (MP3...) یان ڤیدیۆ قبوڵ دەکرێت")
+            return
+        if att.size > SONG_MAX_IN:
+            await self._done(interaction, f"❌ فایلەکە گەورەترە لە {song_size(SONG_MAX_IN)}")
+            return
+        limit = interaction.guild.filesize_limit
+        try:
+            await interaction.edit_original_response(content="⏳ فایلەکە وەردەگیرێت...")
+            data = await att.read()
+        except Exception:
+            await self._done(interaction, "❌ نەتوانرا فایلەکە وەربگیرێت")
+            return
+        try:
+            await m.delete()
+        except Exception:
+            pass
+
+        is_mp3 = (ext == ".mp3" or ct == "audio/mpeg") and not is_video
+        if is_mp3 and len(data) <= limit:
+            self.s.audio, self.s.audio_ext = data, ".mp3"
+            await self._done(interaction, "✅ فایلی MP3 وەرگیرا")
+            return
+
+        await interaction.edit_original_response(content="⏳ دەگۆڕدرێت بۆ MP3 ...")
+        out, err = await song_to_mp3(data, name, limit)
+        if out:
+            self.s.audio, self.s.audio_ext = out, ".mp3"
+            await self._done(interaction, "✅ گۆڕدرا بۆ MP3 و وەرگیرا")
+        elif err == "no-ffmpeg":
+            if len(data) > limit:
+                await self._done(interaction, "❌ فایلەکە گەورەترە لە سنووری ئەم سێرڤەرە و ffmpeg نییە بۆ بچووککردنەوەی")
+                return
+            self.s.audio = data
+            self.s.audio_ext = ext if re.fullmatch(r"\.[a-z0-9]{1,5}", ext) else ".mp3"
+            await self._done(interaction, "⚠️ ffmpeg نییە، فایلەکە وەک خۆی دەنێردرێت (نەگۆڕدرا بۆ MP3)")
+        elif err == "too-big":
+            await self._done(interaction, "❌ تەنانەت دوای بچووککردنەوەش گەورەترە لە سنووری سێرڤەر")
+        else:
+            await self._done(interaction, "❌ نەتوانرا بگۆڕدرێت بۆ MP3، فایلەکە دڵنیا بکەرەوە ئۆدیۆی تێدایە")
+
+    @discord.ui.button(label="Preview", emoji="👁", style=discord.ButtonStyle.secondary, row=2)
+    async def preview_btn(self, interaction, button):
+        s = self.s
+        if not s.title:
+            await interaction.response.send_message("سەرەتا ناوی گۆرانی بنووسە 🎤", ephemeral=True, delete_after=8)
+            return
+        extra = ""
+        if s.audio:
+            extra = f"\n🎧 `{song_filename(s)}` ⋅ {song_size(len(s.audio))}"
+        await interaction.response.send_message(
+            content=f"👁 Preview{extra}", embeds=song_build(s, interaction.user)[:3],
+            files=song_files(s, with_audio=False), ephemeral=True)
+
+    @discord.ui.button(label="Send", emoji="📤", style=discord.ButtonStyle.success, row=2)
+    async def send_btn(self, interaction, button):
+        s = self.s
+        if not s.title:
+            await interaction.response.send_message("سەرەتا ناوی گۆرانی بنووسە 🎤", ephemeral=True, delete_after=8)
+            return
+        if not (s.lyrics or s.audio or s.cover):
+            await interaction.response.send_message(
+                "لانیکەم تێکست، وێنە یان فایلێک زیاد بکە 🌷", ephemeral=True, delete_after=8)
+            return
+        wait = SONG_COOLDOWN - (time.time() - _song_last.get(interaction.user.id, 0))
+        if wait > 0:
+            await interaction.response.send_message(
+                f"چاوەڕێ بکە {int(wait) + 1} چرکە 🌷", ephemeral=True, delete_after=8)
+            return
+        limit = interaction.guild.filesize_limit
+        if len(s.cover or b"") + len(s.audio or b"") > limit:
+            await interaction.response.send_message(
+                f"❌ کۆی فایلەکان گەورەترە لە سنووری سێرڤەر ({song_size(limit)})", ephemeral=True, delete_after=10)
+            return
+
+        _song_last[interaction.user.id] = time.time()
+        await interaction.response.edit_message(
+            embed=discord.Embed(description="📤 دەنێردرێت...", color=SONG_COLOR), view=None)
+        try:
+            embeds = song_build(s, interaction.user)
+            await interaction.channel.send(
+                embed=embeds[0], files=song_files(s, with_audio=True),
+                allowed_mentions=discord.AllowedMentions.none())
+            for extra in embeds[1:]:
+                await interaction.channel.send(embed=extra, allowed_mentions=discord.AllowedMentions.none())
+            result = discord.Embed(description="✅ ناردرا ♡", color=SONG_COLOR)
+        except discord.Forbidden:
+            _song_last.pop(interaction.user.id, None)
+            result = discord.Embed(
+                description="❌ بۆتەکە دەسەڵاتی Send Messages / Embed Links / Attach Files لەم کەناڵە نییە",
+                color=discord.Color.red())
+        except Exception as ex:
+            _song_last.pop(interaction.user.id, None)
+            print(f"song send error: {ex}", flush=True)
+            result = discord.Embed(description="❌ هەڵەیەک ڕوویدا، دووبارە هەوڵ بدەوە", color=discord.Color.red())
+        s.clear_files()
+        self.stop()
+        try:
+            await interaction.edit_original_response(embed=result, view=None)
+        except Exception:
+            pass
+
+    @discord.ui.button(label="Cancel", emoji="✖️", style=discord.ButtonStyle.danger, row=2)
+    async def cancel_btn(self, interaction, button):
+        self.s.clear_files()
+        self.stop()
+        await interaction.response.edit_message(
+            embed=discord.Embed(description="✖️ هەڵوەشایەوە", color=SONG_COLOR), view=None)
+
+
+@bot.tree.command(name="song-texts", description="تێکست، وێنە و فایلی گۆرانی بە شێوازێکی جوان بنێرە")
+@app_commands.guild_only()
+async def song_texts_cmd(interaction: discord.Interaction):
+    s = SongSession()
+    await interaction.response.send_message(
+        embed=song_panel_embed(s), view=SongView(interaction, s), ephemeral=True)
+
+
+# =========================================================
 # 30. RUN
 # =========================================================
 
