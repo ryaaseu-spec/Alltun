@@ -5528,51 +5528,6 @@ def song_files(s, with_audio):
     return files
 
 
-# Components V2: فایلی گۆرانی لەناو هەمان بۆکس و لە خوارەوەی تێکستەکان دەبێت (پێویستی بە discord.py 2.6+ هەیە)
-SONG_V2 = all(hasattr(discord.ui, n) for n in ("LayoutView", "Container", "TextDisplay", "Section", "Thumbnail", "Separator", "File"))
-
-
-def song_layouts(s, user, with_audio):
-    """لیستی (view, files). تێکستی درێژ دەبێتە چەند نامەیەک، فایلی گۆرانی لە کۆتا نامەدا لەناو بۆکسەکەیە"""
-    text = re.sub(r"\n{3,}", "\n\n", s.lyrics.strip())
-    pages = song_split(discord.utils.escape_markdown(text), 3300)
-    out = []
-    for idx, page in enumerate(pages):
-        files = []
-        c = discord.ui.Container(accent_colour=SONG_COLOR)
-        if idx == 0:
-            head = []
-            if s.artist:
-                head.append(f"## {song_style(s.artist, s.font)}")
-            head.append(f"### ♪ {s.title}")
-            head.append("₊˚⊹ ♡ ⋆｡˚ ✧ ˚｡⋆ ♡ ⊹˚₊")
-            head_text = "\n".join(head)
-            if s.cover and s.cover_fn:
-                files.append(discord.File(_io.BytesIO(s.cover), filename=s.cover_fn))
-                c.add_item(discord.ui.Section(
-                    discord.ui.TextDisplay(head_text),
-                    accessory=discord.ui.Thumbnail(f"attachment://{s.cover_fn}")))
-            else:
-                c.add_item(discord.ui.TextDisplay(head_text))
-        if text:
-            c.add_item(discord.ui.Separator())
-            c.add_item(discord.ui.TextDisplay(f">>> {page}"))
-        if idx == len(pages) - 1:
-            if s.audio:
-                c.add_item(discord.ui.Separator())
-                if with_audio:
-                    fn = song_filename(s).replace(" ", "_")     # attachment:// بێ بۆشایی باشترە
-                    files.append(discord.File(_io.BytesIO(s.audio), filename=fn))
-                    c.add_item(discord.ui.File(f"attachment://{fn}"))
-                else:
-                    c.add_item(discord.ui.TextDisplay(f"🎧 `{song_filename(s)}`"))
-            c.add_item(discord.ui.TextDisplay(f"-# ♡ {discord.utils.escape_markdown(user.display_name)}"))
-        lv = discord.ui.LayoutView(timeout=None)
-        lv.add_item(c)
-        out.append((lv, files))
-    return out
-
-
 def song_panel_embed(s):
     ok, no = "✅", "⬜"
     artist = song_style(s.artist, s.font) if s.artist else no
@@ -5841,15 +5796,6 @@ class SongView(discord.ui.View):
         if not s.title:
             await interaction.response.send_message("سەرەتا ناوی گۆرانی بنووسە 🎤", ephemeral=True, delete_after=8)
             return
-        if SONG_V2:
-            try:
-                lv, files = song_layouts(s, interaction.user, with_audio=False)[0]
-                await interaction.response.send_message(view=lv, files=files, ephemeral=True)
-                return
-            except Exception as ex:
-                print(f"song preview v2 error: {ex}", flush=True)
-                if interaction.response.is_done():
-                    return
         extra = ""
         if s.audio:
             extra = f"\n🎧 `{song_filename(s)}` ⋅ {song_size(len(s.audio))}"
@@ -5882,25 +5828,12 @@ class SongView(discord.ui.View):
         await interaction.response.edit_message(
             embed=discord.Embed(description="📤 دەنێردرێت...", color=SONG_COLOR), view=None)
         try:
-            none = discord.AllowedMentions.none()
-            sent = 0
-            if SONG_V2:
-                try:
-                    for lv, files in song_layouts(s, interaction.user, with_audio=True):
-                        await interaction.channel.send(view=lv, files=files, allowed_mentions=none)
-                        sent += 1
-                except discord.Forbidden:
-                    raise
-                except Exception as ex:
-                    print(f"song send v2 error: {ex}", flush=True)
-                    if sent:
-                        raise
-            if not sent:                      # discord.py کۆنە → شێوازی Embed ی ئاسایی
-                embeds = song_build(s, interaction.user)
-                await interaction.channel.send(
-                    embed=embeds[0], files=song_files(s, with_audio=True), allowed_mentions=none)
-                for extra in embeds[1:]:
-                    await interaction.channel.send(embed=extra, allowed_mentions=none)
+            embeds = song_build(s, interaction.user)
+            await interaction.channel.send(
+                embed=embeds[0], files=song_files(s, with_audio=True),
+                allowed_mentions=discord.AllowedMentions.none())
+            for extra in embeds[1:]:
+                await interaction.channel.send(embed=extra, allowed_mentions=discord.AllowedMentions.none())
             result = discord.Embed(description="✅ ناردرا ♡", color=SONG_COLOR)
         except discord.Forbidden:
             _song_last.pop(interaction.user.id, None)
