@@ -1026,6 +1026,9 @@ async def on_message(message):
     if not content:
         return
 
+    if content.startswith("!!"):   # TTS (ElevenLabs) - هیچ کۆمانێک لێرە کار ناکات
+        return
+
     parts = content.split()
     command = ""
 
@@ -6121,6 +6124,144 @@ async def set_bot_bio():
 
 
 bot.add_listener(set_bot_bio, "on_ready")
+
+
+# =========================================================
+# 43. TEXT TO VOICE (ElevenLabs)  —  !! دەقەکەت
+# =========================================================
+# - تەنها ئایدی خۆت (TTS_OWNER_ID) دەتوانێت بەکاری بهێنێت
+# - بنووسە:  !! nmwn bam shewaya ba piti englizi qsa bkam
+#   بۆتەکە نامەکەت دەسڕێتەوە و دەنگی کچێکی ناسک دەنێرێت (فایلی MP3)
+# - API Key هەرگیز لەناو کۆدەکەدا نانووسرێت، لە Railway > Variables:
+#       ELEVENLABS_API_KEY   = کلیلەکەت (پێویستە)
+#       ELEVENLABS_VOICE_ID  = ئایدی دەنگ (ئارەزوومەندانە)
+#       ELEVENLABS_MODEL     = مۆدێل (ئارەزوومەندانە، دیفەڵت eleven_v4)
+#       ELEVENLABS_LANG      = کۆدی زمان (ئارەزوومەندانە، بەتاڵ = خۆکار)
+# - هیچ پاکێجێکی نوێ پێویست نییە (aiohttp لەگەڵ discord.py دێت)
+
+import aiohttp as _aiohttp
+
+TTS_OWNER_ID = 1130455970494025860          # تەنها ئەم ئەکاونتە
+TTS_TRIGGER = "!!"
+TTS_MAX_CHARS = 2500
+TTS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID") or "EXAVITQu4vr4xnSDxMaL"   # Sarah: دەنگی کچێکی ناسک و گەنج
+TTS_MODEL = os.getenv("ELEVENLABS_MODEL") or "eleven_v4"
+TTS_LANG = os.getenv("ELEVENLABS_LANG") or None
+_tts_busy = False
+
+
+async def tts_generate(text):
+    """(mp3 bytes, None) یان (None, هۆکاری هەڵە)"""
+    key = os.getenv("ELEVENLABS_API_KEY")
+    if not key:
+        return None, "ELEVENLABS_API_KEY لە Railway Variables دانەنراوە."
+
+    models = []
+    for m in (TTS_MODEL, "eleven_v3", "eleven_multilingual_v2"):
+        if m not in models:
+            models.append(m)
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{TTS_VOICE_ID}"
+    last_err = "هەڵەی نەزانراو"
+    timeout = _aiohttp.ClientTimeout(total=90)
+    async with _aiohttp.ClientSession(timeout=timeout) as http:
+        for model in models:
+            body = {
+                "text": text,
+                "model_id": model,
+                "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+            }
+            if TTS_LANG:
+                body["language_code"] = TTS_LANG
+            try:
+                async with http.post(
+                    url, params={"output_format": "mp3_44100_128"},
+                    headers={"xi-api-key": key, "Content-Type": "application/json",
+                             "Accept": "audio/mpeg"},
+                    json=body,
+                ) as r:
+                    if r.status == 200:
+                        return await r.read(), None
+                    detail = (await r.text())[:300]
+                    if r.status == 401:
+                        return None, "API Key هەڵەیە یان لابراوە (401)."
+                    if r.status == 402 or "quota" in detail.lower():
+                        return None, "بالانسی ElevenLabs تەواو بووە (quota)."
+                    if r.status == 429:
+                        return None, "زۆر داواکاری نێردرا، کەمێک چاوەڕێ بکە (429)."
+                    last_err = f"{model}: {r.status} {detail}"
+                    print(f"tts error {last_err}", flush=True)
+            except asyncio.TimeoutError:
+                last_err = "کاتەکە بەسەرچوو (timeout)."
+            except Exception as ex:
+                last_err = f"{model}: {ex}"
+                print(f"tts exception {last_err}", flush=True)
+    return None, last_err
+
+
+async def tts_on_message(message):
+    global _tts_busy
+    if message.author.bot or message.guild is None:
+        return
+    if message.author.id != TTS_OWNER_ID:
+        return
+    content = (message.content or "").strip()
+    if not content.startswith(TTS_TRIGGER):
+        return
+
+    text = content[len(TTS_TRIGGER):].strip()
+    if not text:
+        return
+    if len(text) > TTS_MAX_CHARS:
+        await message.channel.send(
+            f"❌ دەقەکە زۆر درێژە ({len(text)}). زۆرترین `{TTS_MAX_CHARS}` پیت.", delete_after=8)
+        return
+
+    if _tts_busy:
+        await message.channel.send("⏳ چاوەڕێ بکە، دەنگێکی تر دروست دەکرێت.", delete_after=5)
+        return
+    _tts_busy = True
+    try:
+        async with message.channel.typing():
+            audio, err = await tts_generate(text)
+
+        if not audio:
+            # نامەکە ناسڕدرێتەوە تا دەقەکەت نەفەوتێت
+            await message.channel.send(f"❌ {err}", delete_after=12)
+            return
+
+        # ئەگەر وەڵامی نامەی کەسێکت دابێتەوە، دەنگەکەش وەڵامی هەمان نامە دەبێت
+        ref = None
+        if message.reference and message.reference.message_id:
+            ref = discord.MessageReference(
+                message_id=message.reference.message_id,
+                channel_id=message.channel.id, fail_if_not_exists=False)
+
+        file = discord.File(_io.BytesIO(audio), filename="voice.mp3")
+        try:
+            await message.channel.send(
+                file=file, reference=ref, mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none())
+        except discord.Forbidden:
+            await message.channel.send(
+                "❌ بۆتەکە دەسەڵاتی Attach Files ی نییە لەم کەناڵە.", delete_after=10)
+            return
+
+        try:
+            await message.delete()
+        except Exception:
+            pass   # بۆتەکە پێویستی بە Manage Messages ە
+    except Exception as ex:
+        print(f"tts handler error: {ex}", flush=True)
+        try:
+            await message.channel.send(f"❌ هەڵە: {ex}", delete_after=10)
+        except Exception:
+            pass
+    finally:
+        _tts_busy = False
+
+
+bot.add_listener(tts_on_message, "on_message")
 
 
 # =========================================================
