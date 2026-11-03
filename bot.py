@@ -2387,7 +2387,13 @@ class PanelChannelSelect(discord.ui.ChannelSelect):
         g = self.view.guild
         getter = {"ar": get_ar, "rk": get_rk, "rkp": get_rk, "bl": get_bl}[self.kind]
         field = "partner_channels" if self.kind == "rkp" else "channels"
-        getter(g.id)[field] = [c.id for c in self.values]
+        picked = [c.id for c in self.values]
+        if self.kind == "ar":
+            # Auto React: کەناڵی نوێ دەخرێتە سەر کەناڵە پێشووەکان (هیچ شتێک ناسڕدرێتەوە)
+            old = getter(g.id)[field]
+            getter(g.id)[field] = old + [c for c in picked if c not in old]
+        else:
+            getter(g.id)[field] = picked
         save_config()
         await panel_edit(interaction, self.view, self.kind)
 
@@ -2441,7 +2447,7 @@ def ar_embed(guild):
     e.add_field(name="کەناڵەکان", value=chans[:1000], inline=False)
     e.add_field(name=f"ئیمۆجیەکان ({len(a['emojis'])}/{AR_MAX_EMOJIS})", value=ems[:1000], inline=False)
     e.add_field(name="ڕیاکت لەسەر", value=AR_MODE_LABELS[a["mode"]], inline=False)
-    e.set_footer(text="کەناڵ هەڵبژێریت، لیستەکەی پێشوو دەگۆڕێت")
+    e.set_footer(text="کەناڵی نوێ هەڵبژێریت زیاد دەبێت بۆ پێشووەکان ✅ | بۆ لابردنی یەک کەناڵ لیستی خوارەوە بەکاربهێنە")
     return e
 
 
@@ -2471,8 +2477,38 @@ def msg_has_video(m):
     return bool(VIDEO_LINK_RX.search(m.content or ""))
 
 
+def ar_has_image(m):
+    """وەک msg_has_image، بەڵام وێنە بچووکەکەی ئیمبێدی بۆت (thumbnail) بە وێنە ناژمێردرێت"""
+    for a in m.attachments:
+        ct = (a.content_type or "").lower()
+        if ct.startswith("image/") or a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+            return True
+    for e in m.embeds:
+        if e.type in ("image", "gifv") or e.image.url:
+            return True
+        if e.type != "rich" and e.thumbnail.url:
+            return True
+    return bool(IMG_LINK_RX.search(m.content or ""))
+
+
+def ar_has_text(m):
+    """دەق لە نامەکە، یان لە ناو ئیمبێدی (وەک تێکستی گۆرانی)"""
+    if (m.content or "").strip():
+        return True
+    for e in m.embeds:
+        if e.type == "rich" and (e.title or e.description or e.fields):
+            return True
+    return False
+
+
 async def ar_on_message(message):
-    if message.author.bot or message.guild is None:
+    if message.guild is None:
+        return
+    # نامەی بۆت (وەک /song-texts) ڕیاکت وەردەگرێت، بەڵام پانێل و دووگمەکان نا
+    if message.author.bot:
+        if message.components or message.id in _ar_pick:
+            return
+    if message.type not in (discord.MessageType.default, discord.MessageType.reply):
         return
     a = get_ar(message.guild.id)
     if not a["enabled"] or not a["emojis"] or not a["channels"]:
@@ -2482,8 +2518,9 @@ async def ar_on_message(message):
         return
 
     has_vid = msg_has_video(message)
-    has_img = msg_has_image(message) and not has_vid
-    has_text = bool((message.content or "").strip())
+    has_img = ar_has_image(message) and not has_vid
+    has_text = ar_has_text(message)
+    has_file = bool(message.attachments)      # ئۆدیۆ / فایل / هەر هاوپێچێک
     mode = a["mode"]
     if mode == "image":
         ok = has_img
@@ -2492,7 +2529,7 @@ async def ar_on_message(message):
     elif mode == "text":
         ok = has_text and not has_img and not has_vid
     else:
-        ok = has_img or has_vid or has_text
+        ok = has_img or has_vid or has_text or has_file or bool(message.embeds)
     if not ok:
         return
 
@@ -2532,6 +2569,27 @@ class ArRemoveSelect(discord.ui.Select):
         await panel_edit(interaction, self.view, "ar")
 
 
+class ArChannelRemoveSelect(discord.ui.Select):
+    """لابردنی یەک یان چەند کەناڵ لە لیستەکە (بەبێ ئەوەی ئەوانی تر بسڕدرێنەوە)"""
+    def __init__(self, guild, channels):
+        opts = []
+        for cid in channels[:25]:
+            ch = guild.get_channel(cid) or guild.get_thread(cid)
+            label = f"#{ch.name}" if ch else f"(کەناڵی سڕاوە) {cid}"
+            opts.append(discord.SelectOption(label=label[:100], value=str(cid)))
+        super().__init__(
+            placeholder="کەناڵ هەڵبژێرە بۆ لابردن لە لیستەکە...",
+            options=opts, min_values=1, max_values=len(opts), row=4
+        )
+
+    async def callback(self, interaction):
+        a = get_ar(self.view.guild.id)
+        gone = {int(v) for v in self.values}
+        a["channels"] = [c for c in a["channels"] if c not in gone]
+        save_config()
+        await panel_edit(interaction, self.view, "ar")
+
+
 class ArEmojiModal(discord.ui.Modal):
     def __init__(self, guild, author_id):
         super().__init__(title="Add Emojis")
@@ -2560,6 +2618,8 @@ class ArView(SecBaseView):
         self.add_item(PanelChannelSelect("ar", row=0))
         if a["emojis"]:
             self.add_item(ArRemoveSelect(a["emojis"]))
+        if a["channels"]:
+            self.add_item(ArChannelRemoveSelect(guild, a["channels"]))
         self.toggle.label = "Auto React: ON" if a["enabled"] else "Auto React: OFF"
         self.toggle.style = discord.ButtonStyle.success if a["enabled"] else discord.ButtonStyle.danger
         self.mode_btn.label = AR_MODE_LABELS[a["mode"]]
@@ -5511,11 +5571,14 @@ def song_build(s, user):
         e.set_author(name=song_style(s.artist, s.font)[:250])
     if s.cover_fn:
         e.set_thumbnail(url=f"attachment://{s.cover_fn}")
-    e.set_footer(text=f"♡ {user.display_name}", icon_url=user.display_avatar.url)
     embeds = [e]
     if text:
         for p in pages[1:]:
             embeds.append(discord.Embed(description=f">>> {p}"[:4000], color=SONG_COLOR))
+    # ئیمزا: ناوی ناردەر بە mention (تاگ) + وێنەی پرۆفایل بە قەبارەی thumbnail (گەورەتر لە footer)
+    sig = discord.Embed(description=f"### ♡ {user.mention}", color=SONG_COLOR)
+    sig.set_thumbnail(url=user.display_avatar.url)
+    embeds.append(sig)               # هەمیشە کۆتا ئیمبێدە
     return embeds
 
 
@@ -5800,7 +5863,8 @@ class SongView(discord.ui.View):
         if s.audio:
             extra = f"\n🎧 `{song_filename(s)}` ⋅ {song_size(len(s.audio))}"
         await interaction.response.send_message(
-            content=f"👁 Preview{extra}", embeds=song_build(s, interaction.user)[:3],
+            content=f"👁 Preview{extra}",
+            embeds=(lambda b: [b[0], b[-1]])(song_build(s, interaction.user)),
             files=song_files(s, with_audio=False), ephemeral=True)
 
     @discord.ui.button(label="Send", emoji="📤", style=discord.ButtonStyle.success, row=2)
@@ -5829,11 +5893,20 @@ class SongView(discord.ui.View):
             embed=discord.Embed(description="📤 دەنێردرێت...", color=SONG_COLOR), view=None)
         try:
             embeds = song_build(s, interaction.user)
-            await interaction.channel.send(
-                embed=embeds[0], files=song_files(s, with_audio=True),
-                allowed_mentions=discord.AllowedMentions.none())
-            for extra in embeds[1:]:
-                await interaction.channel.send(embed=extra, allowed_mentions=discord.AllowedMentions.none())
+            head, sig, pages = embeds[0], embeds[-1], embeds[1:-1]
+            nomention = discord.AllowedMentions.none()
+            if not pages:
+                await interaction.channel.send(
+                    embeds=[head, sig], files=song_files(s, with_audio=True),
+                    allowed_mentions=nomention)
+            else:
+                await interaction.channel.send(
+                    embed=head, files=song_files(s, with_audio=True),
+                    allowed_mentions=nomention)
+                for i, extra in enumerate(pages):
+                    last = (i == len(pages) - 1)
+                    await interaction.channel.send(
+                        embeds=[extra, sig] if last else [extra], allowed_mentions=nomention)
             result = discord.Embed(description="✅ ناردرا ♡", color=SONG_COLOR)
         except discord.Forbidden:
             _song_last.pop(interaction.user.id, None)
@@ -5865,6 +5938,166 @@ async def song_texts_cmd(interaction: discord.Interaction):
     s = SongSession()
     await interaction.response.send_message(
         embed=song_panel_embed(s), view=SongView(interaction, s), ephemeral=True)
+
+
+
+# =========================================================
+# 42. /help  +  BIO ی بۆتەکە
+# =========================================================
+
+HELP_COLOR = discord.Color.from_rgb(250, 205, 235)
+
+BOT_BIO = (
+    "🌸 بۆتی بەڕێوەبردن و چالاکی سێرڤەر\n"
+    "Mute ⋆ Bfra ⋆ Safika ⋆ لۆگ ⋆ پاراستن ⋆ Auto React ⋆ XP ⋆ Ship ⋆ Song Texts و زۆر شتی تر\n"
+    "📖 بۆ ڕوونکردنەوەی هەموو کۆمانەکان و بەکارهێنانیان بنووسە: /help"
+)[:400]
+
+HELP_SECTIONS = {
+    "home": ("📖", "سەرەتا"),
+    "mod": ("🛡", "مۆدەراسیۆن"),
+    "setup": ("⚙️", "ڕێکخستنی سێرڤەر"),
+    "roles": ("👑", "دەسەڵات و ڕۆڵەکان"),
+    "protect": ("🔐", "پاراستن و چاودێری"),
+    "fun": ("🎉", "چالاکی و خۆشی"),
+    "owner": ("🧰", "تایبەت"),
+}
+
+HELP_TEXT = {
+    "mod": (
+        "**ئەم کۆمانانە بێ `/` ـن، تەنها لە چات بیاننووسە** (تاگی کەسەکە بکە یان ڕیپلەی نامەکەی بکە)\n\n"
+        "🔇 **`mute @کەس`**\n└ ئەندام Mute دەکات: ڕۆڵی Muted دەدرێت و نامەکانی دەسڕدرێنەوە.\n"
+        "🔊 **`unmute @کەس`**\n└ Mute لادەبات.\n"
+        "🔨 **`bfra @کەس`**\n└ ئەندام Ban دەکات (دەردەچێت لە سێرڤەر).\n"
+        "♻️ **`unban ئایدی`**\n└ Ban لادەبات، ئایدی ئەندامەکە بنووسە، وەک `unban 123456789012345678`.\n"
+        "🧹 **`safika 10`**\n└ ژمارەیەک نامە دەسڕێتەوە لە کەناڵەکە (تا 1000).\n"
+        "🔒 **`lock`** / 🔓 **`unlock`**\n└ کەناڵەکە دادەخات یان دەیکاتەوە بۆ نووسین (پێویستی بە Manage Channels هەیە).\n\n"
+        "-# کێ دەتوانێت: ڕۆڵی Mute بە `/rolemute` ، Bfra بە `/roleban` ، Safika بە `/rolesafika` دیاری دەکرێت."
+    ),
+    "setup": (
+        "**تەنها Administrator / دیڤیلۆپەر**\n\n"
+        "📜 **`/setlog`**\n└ کەناڵی هەر جۆرە لۆگێک دیاری دەکات (Chat، Voice، Ban، Role، Channel ...).\n"
+        "📚 **`/setlogall`**\n└ هەموو لۆگەکان دەخاتە یەک کەناڵەوە.\n"
+        "🔇 **`/setmuterole`**\n└ ئەو ڕۆڵە دیاری دەکات کە لە کاتی Mute دەدرێت.\n"
+        "🎁 **`/autorole`**\n└ چەند ڕۆڵێک کە خۆکار دەدرێن بە ئەندامی نوێ.\n"
+        "👋 **`/welcome`**\n└ کەناڵەکانی بەخێرهاتن و نامەی بەخێرهاتن.\n"
+        "🔢 **`/counting`**\n└ کەناڵی ژماردن (1، 2، 3 ...) و یاساکانی.\n"
+        "🗂 **`/config`**\n└ هەموو ڕێکخستنەکانی ئەم سێرڤەرە پیشان دەدات."
+    ),
+    "roles": (
+        "**کێ بتوانێت چی بکات**\n\n"
+        "🧑‍💻 **`/setdev`**\n└ ڕۆڵی دیڤیلۆپەر (تەنها خاوەنی سێرڤەر).\n"
+        "🔇 **`/rolemute`** ⋅ 🔨 **`/roleban`** ⋅ 🧹 **`/rolesafika`**\n└ ئەو ڕۆڵانەی دەتوانن Mute / Bfra / Safika بکەن.\n"
+        "⭐ **`/rolestaff`**\n└ ئەو ڕۆڵانەی دەتوانن `/staff` بەکاربهێنن.\n"
+        "🛠 **`/setstaff`**\n└ ڕۆڵەکانی Lady Staff و Boy Staff دیاری دەکات.\n"
+        "🎖 **`/staff`**\n└ ڕۆڵی ستاف دەدات بە ئەندام (Lady / Boy Staff).\n"
+        "🎨 **`/rangi-role`**\n└ ڕەنگی ڕۆڵ دەگۆڕێت، کۆدی ڕەنگ بنووسە وەک `#FF0000`.\n"
+        "✅ **`/regadan-ranggorin`**\n└ ڕۆڵ و کەسانی ڕێگەپێدراو بۆ گۆڕینی ڕەنگ.\n"
+        "🚫 **`/regri`**\n└ قەدەغەکردن یان ڕێگەپێدانی گۆڕینی ڕەنگ بۆ ئەندامێک.\n"
+        "🔑 **`/regri-roles`**\n└ ئەو ڕۆڵانەی دەتوانن `/regri` بەکاربهێنن."
+    ),
+    "protect": (
+        "🛡 **`/security`**\n└ سیستمی پاراستن: Anti-Spam و Anti-Nuke (دژی سپام و تێکدانی سێرڤەر)، سزا، وایت لیست و لۆگ.\n\n"
+        "🔗 **`/blocklink`**\n└ کەناڵەکانێک دیاری دەکەیت کە لینکی تێدا قەدەغەیە (نامەکە دەسڕدرێتەوە).\n\n"
+        "📢 **`/reklam`**\n└ کاتێک کەسێک وشەی Reklam دەنووسێت، بۆتەکە نامەی جوانی ڕێکلام دەنێرێت و ڕۆڵەکانی دیاریکراو تاگ دەکات. "
+        "بەشی **Partner**یش هەیە: لە کەناڵی پارتنەر تەنها نامەی لینکی سێرڤەر ڕێگەپێدراوە.\n\n"
+        "😀 **`/autoreact`**\n└ ڕیاکتی خۆکار لە کەناڵە دیاریکراوەکان: هەر نامەیەک (دەق، وێنە، ڤیدیۆ، نامەی بۆت و تێکستی گۆرانی) ئیمۆجییەکان وەرگرێت.\n"
+        "   ⋅ کەناڵی نوێ هەڵبژێریت زیاد دەبێت بۆ پێشووەکان\n"
+        "   ⋅ لیستی لابردن بۆ لابردنی یەک کەناڵ\n"
+        "   ⋅ **Mode**: هەموو / تەنها وێنە / تەنها ڤیدیۆ / تەنها دەق\n"
+        "   ⋅ **Pick by Reacting**: ئیمۆجی وەک ڕیاکت دابنێ و بۆتەکە خۆی زیادیان بکات"
+    ),
+    "fun": (
+        "✨ **`/xp`**\n└ تۆپی XP: چات و ڤۆیس، ڕۆژانە / هەفتانە / مانگانە / ساڵانە، خۆکار نوێ دەبێتەوە.\n"
+        "⚙️ **`/setxp`**\n└ دیاری دەکات کێ و لە کوێ دەتوانێت `/xp` بەکاربهێنێت.\n\n"
+        "💞 **`ship @کەس`**\n└ ڕێژەی خۆشەویستی نێوان تۆ و ئەو کەسە (هەموو ڕۆژێک نوێ دەبێتەوە).\n"
+        "💋 **`kiss`** / `mach` ⋅ 🫶 **`hug`** / `bawesh` ⋅ 🎀 **`pat`** / `naz` + `@کەس`\n└ ماچ، باوەش و نازدان.\n"
+        "🛠 **`/setlove`**\n└ کەناڵەکان و نووسینی ship / kiss / hug ڕێکدەخات.\n\n"
+        "🎶 **`/song-texts`** (هەموو کەسێک)\n└ تێکست، وێنە و فایلی گۆرانی بە شێوازێکی جوان دەنێرێت:\n"
+        "   ⋅ 🎤 ناوی گۆرانیبێژ و گۆرانی ⋅ 📝 تێکست ⋅ 🖼 وێنە ⋅ 🎧 فایل (ڤیدیۆ خۆکار دەبێتە MP3)\n"
+        "   ⋅ 🔤 فۆنتی ناوی گۆرانیبێژ ⋅ 👁 Preview ⋅ 📤 Send"
+    ),
+    "owner": (
+        "🧬 **`/create_channels`**\n└ **تەنها خاوەنی بۆت.** سێرڤەرێک کۆپی دەکات (ڕۆڵ، کەناڵ، Permission، ئیمۆجی و ڕێکخستنەکانی بۆت) و لە سێرڤەرێکی تر دایدەنێتەوە (Paste).\n"
+        "-# سێرڤەری سەرچاوە دەپارێزرێت و هیچ شتێکی تێدا ناسڕدرێتەوە."
+    ),
+}
+
+
+HELP_SHORT = {
+    "mod": "mute ⋅ unmute ⋅ bfra ⋅ unban ⋅ safika ⋅ lock ⋅ unlock",
+    "setup": "/setlog ⋅ /setlogall ⋅ /setmuterole ⋅ /autorole ⋅ /welcome ⋅ /counting ⋅ /config",
+    "roles": "/setdev ⋅ /rolemute ⋅ /roleban ⋅ /rolesafika ⋅ /rolestaff ⋅ /staff ⋅ /rangi-role ⋅ /regri",
+    "protect": "/security ⋅ /blocklink ⋅ /reklam ⋅ /autoreact",
+    "fun": "/xp ⋅ /setxp ⋅ ship ⋅ kiss ⋅ hug ⋅ pat ⋅ /setlove ⋅ /song-texts",
+    "owner": "/create_channels",
+}
+
+
+def help_embed(key):
+    icon, name = HELP_SECTIONS[key]
+    if key == "home":
+        e = discord.Embed(
+            title="📖 یارمەتی بۆتەکە",
+            description="لە لیستی خوارەوە بەشێک هەڵبژێرە، هەموو کۆمانەکان و بۆچوونیان و چۆنیەتی بەکارهێنانیان پیشان دەدرێت 🌸",
+            color=HELP_COLOR)
+        for k, (ic, nm) in HELP_SECTIONS.items():
+            if k != "home":
+                e.add_field(name=f"{ic} {nm}", value=HELP_SHORT[k], inline=False)
+        e.set_footer(text="کۆمانی بێ / (وەک mute) تەنها بە نووسین لە چات کار دەکات")
+        return e
+    return discord.Embed(title=f"{icon} {name}", description=HELP_TEXT[key], color=HELP_COLOR)
+
+
+class HelpSelect(discord.ui.Select):
+    def __init__(self, current):
+        opts = [discord.SelectOption(label=nm, value=k, emoji=ic, default=(k == current))
+                for k, (ic, nm) in HELP_SECTIONS.items()]
+        super().__init__(placeholder="بەشێک هەڵبژێرە...", options=opts, min_values=1, max_values=1)
+
+    async def callback(self, interaction):
+        await interaction.response.edit_message(
+            embed=help_embed(self.values[0]), view=HelpView(interaction.user.id, self.values[0]))
+
+
+class HelpView(discord.ui.View):
+    def __init__(self, author_id, current="home"):
+        super().__init__(timeout=600)
+        self.author_id = author_id
+        self.add_item(HelpSelect(current))
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "ئەمە پانێلی کەسێکی ترە، خۆت `/help` بنووسە 🌷", ephemeral=True)
+            return False
+        return True
+
+
+@bot.tree.command(name="help", description="ڕوونکردنەوەی هەموو کۆمان و بەشەکانی بۆتەکە")
+async def help_cmd(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        embed=help_embed("home"), view=HelpView(interaction.user.id), ephemeral=True)
+
+
+_bio_done = False
+
+
+async def set_bot_bio():
+    """بیۆی بۆتەکە (About Me) نوێ دەکاتەوە، تێیدا /help ی نووسراوە"""
+    global _bio_done
+    if _bio_done:
+        return
+    _bio_done = True
+    try:
+        from discord.http import Route
+        await bot.http.request(Route("PATCH", "/applications/@me"), json={"description": BOT_BIO})
+        print("Bot bio updated", flush=True)
+    except Exception as ex:
+        print(f"bio update failed: {ex}", flush=True)
+
+
+bot.add_listener(set_bot_bio, "on_ready")
 
 
 # =========================================================
