@@ -5523,6 +5523,7 @@ class SongSession:
         self.audio_ext = ".mp3"
         self.font = "script"
         self.note = ""
+        self.friends = []                 # مێنشنی کەسانی تر (تەنها وەک تاگ، بێ وێنە)
 
     def clear_files(self):
         self.cover = None
@@ -5560,25 +5561,42 @@ def song_size(n):
     return f"{n / 1024 / 1024:.1f} MB"
 
 
+SONG_CENTER_W = 26      # پانی دیاریکراوی دیزاینەکە بۆ ناوەڕاست کردن (ئەگەر کەم/زۆر لە ناوەڕاست بوو ئەمە بگۆڕە)
+SONG_BLANK = "\u2800"   # بۆشایی نادیار بۆ ناوەڕاست کردن (Discord بۆشایی ئاسایی دەسڕێتەوە)
+
+
+def song_signature(s, user):
+    """ئیمزا: مێنشنی خۆت + کەسانی تر، لە ناوەڕاستدا بە شێوازی جوان، لەناو هەمان بۆکس"""
+    members = [(user.mention, user.display_name)]
+    for uid, name, mention in s.friends:
+        if uid != user.id:
+            members.append((mention, name))
+    width = sum(len(n) + 1 for _, n in members) + 3 * len(members) + 2 * (len(members) - 1)
+    pad = max(0, int((SONG_CENTER_W - 1.5 * width) / 3))
+    body = " ✧ ".join(m for m, _ in members)
+    return f"### {SONG_BLANK * pad}♡ {body} ♡"
+
+
 def song_build(s, user):
-    """بۆرد(ەکان): یەکەم بۆرد سەر + تێکست، ئەگەر تێکست درێژ بوو بۆردی زیاتر"""
+    """بۆرد(ەکان): یەکەم بۆرد = سەر + ئیمزا (مێنشن) + تێکست، ئەگەر تێکست درێژ بوو بۆردی زیاتر"""
     text = re.sub(r"\n{3,}", "\n\n", s.lyrics.strip())
     pages = song_split(discord.utils.escape_markdown(text))
     head = "₊˚⊹ ♡ ⋆｡˚ ✧ ˚｡⋆ ♡ ⊹˚₊"
-    desc = head + (f"\n\n>>> {pages[0]}" if text else "")
+    # ئیمزا پێش تێکستەکە دادەنرێت، چونکە >>> هەموو شتێکی دوای خۆی دەخاتە ناو quote
+    desc = head + "\n" + song_signature(s, user) + (f"\n>>> {pages[0]}" if text else "")
     e = discord.Embed(title=f"♪ {s.title}"[:250], description=desc[:4000], color=SONG_COLOR)
     if s.artist:
         e.set_author(name=song_style(s.artist, s.font)[:250])
+    # وێنەی خۆت: ئەگەر وێنەی گۆرانی نەبوو وەک thumbnail، ئەگەر هەبوو لە footer
     if s.cover_fn:
         e.set_thumbnail(url=f"attachment://{s.cover_fn}")
+        e.set_footer(text=song_style(user.display_name, s.font)[:100], icon_url=user.display_avatar.url)
+    else:
+        e.set_thumbnail(url=user.display_avatar.url)
     embeds = [e]
     if text:
         for p in pages[1:]:
             embeds.append(discord.Embed(description=f">>> {p}"[:4000], color=SONG_COLOR))
-    # ئیمزا: ناوی ناردەر بە mention (تاگ) + وێنەی پرۆفایل بە قەبارەی thumbnail (گەورەتر لە footer)
-    sig = discord.Embed(description=f"### ♡ {user.mention}", color=SONG_COLOR)
-    sig.set_thumbnail(url=user.display_avatar.url)
-    embeds.append(sig)               # هەمیشە کۆتا ئیمبێدە
     return embeds
 
 
@@ -5601,6 +5619,7 @@ def song_panel_embed(s):
         f"🖼 **وێنە:** {f'{ok} {song_size(len(s.cover))}' if s.cover else no}",
         f"🎧 **فایل:** {f'{ok} {song_filename(s)} ⋅ {song_size(len(s.audio))}' if s.audio else no}",
         f"🔤 **فۆنت:** {SONG_FONTS[s.font][0]}",
+        f"👥 **مێنشن:** {' '.join(m for _, _, m in s.friends) if s.friends else no}",
     ]
     e = discord.Embed(
         title="🎶 Song Texts",
@@ -5708,6 +5727,18 @@ class SongFontSelect(discord.ui.Select):
         await interaction.response.edit_message(embed=song_panel_embed(sv.s), view=sv)
 
 
+class SongMentionSelect(discord.ui.UserSelect):
+    def __init__(self):
+        super().__init__(placeholder="👥 مێنشنی کەسانی تر (ئارەزوومەندانە، تا ٥ کەس)...",
+                         min_values=0, max_values=5, row=3)
+
+    async def callback(self, interaction):
+        sv = self.view
+        sv.s.friends = [(u.id, u.display_name, u.mention) for u in self.values if not u.bot]
+        sv.s.note = ""
+        await interaction.response.edit_message(embed=song_panel_embed(sv.s), view=sv)
+
+
 # ---------- پانێل ----------
 
 class SongView(discord.ui.View):
@@ -5717,6 +5748,7 @@ class SongView(discord.ui.View):
         self.s = session
         self.author_id = root.user.id
         self.add_item(SongFontSelect(session.font))
+        self.add_item(SongMentionSelect())
 
     async def interaction_check(self, interaction):
         if interaction.user.id != self.author_id:
@@ -5864,7 +5896,7 @@ class SongView(discord.ui.View):
             extra = f"\n🎧 `{song_filename(s)}` ⋅ {song_size(len(s.audio))}"
         await interaction.response.send_message(
             content=f"👁 Preview{extra}",
-            embeds=(lambda b: [b[0], b[-1]])(song_build(s, interaction.user)),
+            embeds=song_build(s, interaction.user)[:1],
             files=song_files(s, with_audio=False), ephemeral=True)
 
     @discord.ui.button(label="Send", emoji="📤", style=discord.ButtonStyle.success, row=2)
@@ -5893,20 +5925,17 @@ class SongView(discord.ui.View):
             embed=discord.Embed(description="📤 دەنێردرێت...", color=SONG_COLOR), view=None)
         try:
             embeds = song_build(s, interaction.user)
-            head, sig, pages = embeds[0], embeds[-1], embeds[1:-1]
-            nomention = discord.AllowedMentions.none()
-            if not pages:
-                await interaction.channel.send(
-                    embeds=[head, sig], files=song_files(s, with_audio=True),
-                    allowed_mentions=nomention)
-            else:
-                await interaction.channel.send(
-                    embed=head, files=song_files(s, with_audio=True),
-                    allowed_mentions=nomention)
-                for i, extra in enumerate(pages):
-                    last = (i == len(pages) - 1)
-                    await interaction.channel.send(
-                        embeds=[extra, sig] if last else [extra], allowed_mentions=nomention)
+            # مێنشن لەناو embed نوتیفیکەیشن نانێرێت، بۆیە کەسە مێنشنکراوەکان لە content ی نامەکەش دادەنێین
+            # (تەنها ئەو کەسانە ping دەکرێن کە هەڵتبژاردوون؛ role/everyone هەرگیز)
+            friends = [(uid, m) for uid, _, m in s.friends if uid != interaction.user.id]
+            ping = discord.AllowedMentions(
+                users=[discord.Object(id=uid) for uid, _ in friends],
+                roles=False, everyone=False, replied_user=False)
+            await interaction.channel.send(
+                content=" ".join(m for _, m in friends) or None,
+                embed=embeds[0], files=song_files(s, with_audio=True), allowed_mentions=ping)
+            for extra in embeds[1:]:
+                await interaction.channel.send(embed=extra, allowed_mentions=discord.AllowedMentions.none())
             result = discord.Embed(description="✅ ناردرا ♡", color=SONG_COLOR)
         except discord.Forbidden:
             _song_last.pop(interaction.user.id, None)
