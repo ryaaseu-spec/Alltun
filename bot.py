@@ -5583,7 +5583,7 @@ def song_build(s, user):
     pages = song_split(discord.utils.escape_markdown(text))
     head = "₊˚⊹ ♡ ⋆｡˚ ✧ ˚｡⋆ ♡ ⊹˚₊"
     # ئیمزا پێش تێکستەکە دادەنرێت، چونکە >>> هەموو شتێکی دوای خۆی دەخاتە ناو quote
-    desc = head + "\n" + song_signature(s, user) + (f"\n>>> {pages[0]}" if text else "")
+    desc = head + "\n" + song_signature(s, user) + (f"\n\n>>> {pages[0]}" if text else "")
     e = discord.Embed(title=f"♪ {s.title}"[:250], description=desc[:4000], color=SONG_COLOR)
     if s.artist:
         e.set_author(name=song_style(s.artist, s.font)[:250])
@@ -5925,17 +5925,11 @@ class SongView(discord.ui.View):
             embed=discord.Embed(description="📤 دەنێردرێت...", color=SONG_COLOR), view=None)
         try:
             embeds = song_build(s, interaction.user)
-            # مێنشن لەناو embed نوتیفیکەیشن نانێرێت، بۆیە کەسە مێنشنکراوەکان لە content ی نامەکەش دادەنێین
-            # (تەنها ئەو کەسانە ping دەکرێن کە هەڵتبژاردوون؛ role/everyone هەرگیز)
-            friends = [(uid, m) for uid, _, m in s.friends if uid != interaction.user.id]
-            ping = discord.AllowedMentions(
-                users=[discord.Object(id=uid) for uid, _ in friends],
-                roles=False, everyone=False, replied_user=False)
+            nomention = discord.AllowedMentions.none()      # مێنشن تەنها لەناو ئیمبێد دەردەکەوێت، بێ نوتیفیکەیشن
             await interaction.channel.send(
-                content=" ".join(m for _, m in friends) or None,
-                embed=embeds[0], files=song_files(s, with_audio=True), allowed_mentions=ping)
+                embed=embeds[0], files=song_files(s, with_audio=True), allowed_mentions=nomention)
             for extra in embeds[1:]:
-                await interaction.channel.send(embed=extra, allowed_mentions=discord.AllowedMentions.none())
+                await interaction.channel.send(embed=extra, allowed_mentions=nomention)
             result = discord.Embed(description="✅ ناردرا ♡", color=SONG_COLOR)
         except discord.Forbidden:
             _song_last.pop(interaction.user.id, None)
